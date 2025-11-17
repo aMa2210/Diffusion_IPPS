@@ -29,17 +29,19 @@ from random import randint
 from Industrial_Pipeline_Functions import (
     compute_edge_weights,
     compute_marginal_probs,
+    load_ipps_problem_from_json,  # <-- 修改
+    get_ipps_problem_data,     # <-- 修改
+    validate_constraints
 )
 
 
 
-
 import networkx as nx
-ROOT_OUT = Path("ablation_runs_11_16_standard_posterior")
+ROOT_OUT = Path("ablation_runs_11_17_posterior_randomChooseIfInvalid")
 ROOT_OUT.mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DATASET = IndustrialGraphDataset(root="industrial_dataset")
+DATASET = IndustrialGraphDataset(root="Trainset")
 # ### WEIGHTED TRAINING
 # import pandas as pd # get the metric file for the training dataset to determine which data should be repeated
 # from sklearn.preprocessing import MinMaxScaler
@@ -63,9 +65,12 @@ DATASET = IndustrialGraphDataset(root="industrial_dataset")
 
 LOADER  = DataLoader(DATASET, batch_size=4, shuffle=True)
 
-
 EDGE_W  = compute_edge_weights(DATASET, DEVICE)
 NODE_M, EDGE_M = compute_marginal_probs(DATASET, DEVICE)
+
+PROBLEM_FILE = "TestSet/1.json"
+problem_workpieces, problem_machines = load_ipps_problem_from_json(PROBLEM_FILE)
+IPPS_CANVAS = get_ipps_problem_data(problem_workpieces, problem_machines, DEVICE)
 
 EPOCHS = 30
 # EPOCHS = 60
@@ -76,7 +81,7 @@ N_SAMP  = 300
 
 class GraphEncoder(torch.nn.Module):
     """Mini-GIN → mean-pool → linear  (128-D por defecto)."""
-    def __init__(self, in_dim=4, hid=64, out=128):
+    def __init__(self, in_dim=2, hid=64, out=128):
         super().__init__()
         mlp = torch.nn.Sequential(torch.nn.Linear(in_dim, hid),
                                   torch.nn.ReLU(),
@@ -95,7 +100,7 @@ def encode_graphs(list_dicts, encoder, device='cpu', bs=64):
     """Convierte tu lista de dicts {'nodes','edges'} en embeddings."""
     data_objs = []
     for g in list_dicts:
-        x = torch.nn.functional.one_hot(g["nodes"], num_classes=4).float()
+        x = torch.nn.functional.one_hot(g["nodes"], num_classes=2).float()
         edge_idx = (g["edges"] > 0).nonzero(as_tuple=False).t().contiguous()
         from torch_geometric.data import Data
         data_objs.append(Data(x=x, edge_index=edge_idx))
@@ -136,7 +141,7 @@ import numpy as np
 
 device = DEVICE  
 
-ENC = GraphEncoder(in_dim=4).to(device).eval()
+ENC = GraphEncoder(in_dim=2).to(device).eval()
 
 def _embed_dataset(dataset):
     objs = []
@@ -186,7 +191,7 @@ def wl_hash(nodes, edges):
     return nx.weisfeiler_lehman_graph_hash(G, node_attr="label")
 
 
-def compute_metrics(model, out_dir, n_samples=N_SAMP, reuse_samples=True):
+def compute_metrics(model, out_dir, ipps_canvas, n_samples=N_SAMP, reuse_samples=True):
     model.eval()
     samples_path = out_dir / "samples.pt"
 
@@ -197,16 +202,17 @@ def compute_metrics(model, out_dir, n_samples=N_SAMP, reuse_samples=True):
     else:
         print("🎲  Generating new samples...")
         samples = []
+        data_canvas = ipps_canvas.to(DEVICE)
         with torch.no_grad():
             for _ in tqdm(range(n_samples)):
-                n = 15
-                edge_idx = torch.tensor([(i, j) for i in range(n) for j in range(n) if i != j],
-                                        dtype=torch.long).t().contiguous().to(DEVICE)
-                data = Data(x=torch.zeros(n, model.node_num_classes, device=DEVICE),
-                            edge_index=edge_idx)
-                data.batch = torch.zeros(n, dtype=torch.long, device=DEVICE)
+                # n = 15
+                # edge_idx = torch.tensor([(i, j) for i in range(n) for j in range(n) if i != j],
+                #                         dtype=torch.long).t().contiguous().to(DEVICE)
+                # data = Data(x=torch.zeros(n, model.node_num_classes, device=DEVICE),
+                #             edge_index=edge_idx)
+                # data.batch = torch.zeros(n, dtype=torch.long, device=DEVICE)
                 nodes, edges, _ = model.reverse_diffusion_single(
-                    data, DEVICE, save_intermediate=False)
+                    data_canvas, DEVICE, save_intermediate=False)
                 samples.append((nodes.cpu(), edges.squeeze(0).cpu()))
         torch.save(samples, samples_path)
         print(f"💾  Samples saved to: {samples_path}")
@@ -214,8 +220,10 @@ def compute_metrics(model, out_dir, n_samples=N_SAMP, reuse_samples=True):
     # --- metrics from (possibly reused) samples ---
     hashes = [wl_hash(n_lbls.cpu(), e_mat.cpu()) for (n_lbls, e_mat) in samples]
 
-    # validity
-    viol = sum(not validate_constraints(e_mat, n_lbls, DEVICE) for (n_lbls, e_mat) in samples)
+    data_canvas_cpu = ipps_canvas.to("cpu")  # <-- 修改
+    viol = sum(not validate_constraints(e_mat, n_lbls, "cpu", data=data_canvas_cpu)
+               for (n_lbls, e_mat) in samples)
+
     validity = 1 - viol / len(samples) if len(samples) > 0 else 0.0
 
     # uniqueness (WL)
@@ -303,7 +311,7 @@ for cfg in ABLATIONS:
             did_train = True
 
     # metrics (reuses samples.pt if present)
-    metrics = compute_metrics(model, run_dir, n_samples=N_SAMP, reuse_samples=True)
+    metrics = compute_metrics(model, run_dir, IPPS_CANVAS, n_samples=N_SAMP, reuse_samples=True)
     metrics.update({
         "run_dir": str(run_dir),
         "model_id": model_id,

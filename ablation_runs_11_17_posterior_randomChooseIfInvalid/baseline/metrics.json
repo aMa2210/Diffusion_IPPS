@@ -1,0 +1,16 @@
+{
+  "validity": 1.0,
+  "uniqueness": 1.0,
+  "novelty": 1.0,
+  "fid": -9.322458796991356e-05,
+  "mmd": -0.0006844401359558105,
+  "run_dir": "ablation_runs_11_17_posterior_randomChooseIfInvalid\\baseline",
+  "model_id": "baseline",
+  "weights_path": "ablation_runs_11_17_posterior_randomChooseIfInvalid\\baseline\\model.pth",
+  "did_train": 1,
+  "name": "baseline",
+  "hidden_dim": 12,
+  "kl": 0.1,
+  "constraint": 1.0,
+  "use_projector": true
+}
