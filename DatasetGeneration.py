@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple
 import copy
 import os
+import sys
+import json
 
 @dataclass
 class Workpiece:
@@ -22,25 +24,26 @@ class Workpiece:
             print(f"- Processing Time: {self.processing_time[feature]}")
         print()
 
-Workpiece1 = Workpiece(name="Workpiece1", 
-                      optional_machines=[[1,3,6], [2,3,4,5], [2,3,5,6], [1,6], [1,4,5], [3,4,5,6], [1,2,4]], 
-                      processing_time=[[6,8,7], [5,7,6,9], [8,7,6,6], [8,9], [7,5,8], [9,9,7,8], [5,7,6]])
 
-Workpiece2 = Workpiece(name="Workpiece2", 
-                      optional_machines=[[1,3], [2,4,6], [1,5,6], [3,4,5,6], [1,2,3,4,5]], 
-                      processing_time=[[7,6], [5,8,7], [9,8,8], [7,7,7,6], [8,8,9,9,9]])
+def load_workpieces_from_json(json_path: str) -> List[Workpiece]:
+    if not os.path.exists(json_path):
+        print(f"❌ Error: File not found at {json_path}")
+        sys.exit(1)
 
-Workpiece3 = Workpiece(name="Workpiece3", 
-                      optional_machines=[[1,2,3,4,5], [1,4,6], [3,5], [2,6], [3,4,5], [1,3,4,6]], 
-                      processing_time=[[3,4,5,5,4], [5,4,4], [4,3], [5,3], [6,8,7], [6,7,7,5]])
+    with open(json_path, 'r') as f:
+        data = json.load(f)
 
-Workpiece4 = Workpiece(name="Workpiece4", 
-                      optional_machines=[[5,6], [4,5], [1,2,3,4], [2,3,4,5], [1,2,6], [2,5], [1,2,3,4,6], [2,5,6], [2,3,4,6]], 
-                      processing_time=[[7,6], [6,5], [5,6,4,5], [5,6,4,4], [7,7,7], [8,8], [12,10,9,11,9], [3,3,4], [4,5,7,4]])
+    loaded_workpieces = []
+    for wp_data in data['workpieces']:
+        new_wp = Workpiece(
+            name=wp_data['name'],
+            optional_machines=wp_data['optional_machines'],
+            processing_time=wp_data['processing_time']
+        )
+        loaded_workpieces.append(new_wp)
 
-Workpiece5 = Workpiece(name="Workpiece5", 
-                      optional_machines=[[2,4], [1,3,5], [1,2,5], [3,4,5,6], [2,3], [3,5,6], [1,2,4,6], [1,2]], 
-                      processing_time=[[8,7], [6,8,9], [7,7,8], [5,8,6,5], [6,7], [2,5,3], [9,9,4,4], [5,5]])
+    print(f"✅ Successfully loaded {len(loaded_workpieces)} workpieces from {json_path}")
+    return loaded_workpieces
 
 machine_power = {
     1: {'no_load': 0.8, 'processing': 2.4},
@@ -129,7 +132,7 @@ def plot_makespan_vs_energy(dataset: pd.DataFrame, filename: str = "makespan_vs_
     print(f"   Makespan range: {makespan.min():.1f} - {makespan.max():.1f}")
     print(f"   Energy range: {energy.min():.1f} - {energy.max():.1f} kWh")
 
-def generate_multiple_simulations(n_simulations: int, seed: int = None) -> pd.DataFrame:
+def generate_multiple_simulations(workpieces: List[Workpiece], n_simulations: int, seed: int = None) -> pd.DataFrame:
     """
     Generate multiple production cycles and save results to Excel
     
@@ -152,8 +155,8 @@ def generate_multiple_simulations(n_simulations: int, seed: int = None) -> pd.Da
         # Generate random cycles for each workpiece
         workpiece_cycles = []
         cycle_details = {}
-        
-        for workpiece in [Workpiece1, Workpiece2, Workpiece3, Workpiece4, Workpiece5]:
+
+        for workpiece in workpieces:
             selected_machines, processing_times = generate_random_cycle(workpiece)
             workpiece_cycles.append((workpiece.name, selected_machines, processing_times))
             cycle_details[workpiece.name] = {
@@ -177,7 +180,8 @@ def generate_multiple_simulations(n_simulations: int, seed: int = None) -> pd.Da
         }
         
         # Add cycle details for each workpiece
-        for wp_name in ['Workpiece1', 'Workpiece2', 'Workpiece3', 'Workpiece4', 'Workpiece5']:
+        for wp in workpieces:
+            wp_name = wp.name
             cycle_info = cycle_details[wp_name]
             result[f'{wp_name}_machines'] = str(cycle_info['machines'])
             result[f'{wp_name}_processing_times'] = str(cycle_info['processing_times'])
@@ -622,12 +626,13 @@ if __name__ == "__main__":
     # Option 1: Run single simulation (as before)
     print("🎯 SINGLE SIMULATION")
     print("=" * 50)
-    
+    PROBLEM_FILE = "TestSet/1.json"
+    loaded_workpieces = load_workpieces_from_json(PROBLEM_FILE)
     # Generate random cycles for each workpiece
     random.seed(42)  # For reproducible results
     
     workpiece_cycles = []
-    for workpiece in [Workpiece1, Workpiece2, Workpiece3, Workpiece4, Workpiece5]:
+    for workpiece in loaded_workpieces:
         selected_machines, processing_times = generate_random_cycle(workpiece)
         workpiece_cycles.append((workpiece.name, selected_machines, processing_times))
     
@@ -655,4 +660,4 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Generate 100 simulations and save to Excel
-    dataset = generate_multiple_simulations(n_simulations=500, seed=42)
+    dataset = generate_multiple_simulations(workpieces=loaded_workpieces, n_simulations=500, seed=42)
