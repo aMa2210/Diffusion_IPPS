@@ -160,21 +160,21 @@ ABLATIONS = [
     {"name": "baseline",
      "hidden_dim": 12, "kl": 0.1, "constraint": 1.0, "use_projector": True},
 
-    # same size but without the projector
-    {"name": "no_projector",
-     "hidden_dim": 12, "kl": 0.1, "constraint": 0.0, "use_projector": False},
-
-    # smaller network: 32 → half of 64
-    {"name": "half_hidden",
-     "hidden_dim": 6, "kl": 0.1, "constraint": 1.0, "use_projector": True},
-
-    # random weights + projector
-    {"name": "random_projector",
-     "hidden_dim": 12, "kl": 0.0, "constraint": 0.0,
-     "use_projector": True, "skip_training": True},
-
-    {"name": "hidden_24",
-     "hidden_dim": 24, "kl": 0.1, "constraint": 1.0, "use_projector": True},
+    # # same size but without the projector
+    # {"name": "no_projector",
+    #  "hidden_dim": 12, "kl": 0.1, "constraint": 0.0, "use_projector": False},
+    #
+    # # smaller network: 32 → half of 64
+    # {"name": "half_hidden",
+    #  "hidden_dim": 6, "kl": 0.1, "constraint": 1.0, "use_projector": True},
+    #
+    # # random weights + projector
+    # {"name": "random_projector",
+    #  "hidden_dim": 12, "kl": 0.0, "constraint": 0.0,
+    #  "use_projector": True, "skip_training": True},
+    #
+    # {"name": "hidden_24",
+    #  "hidden_dim": 24, "kl": 0.1, "constraint": 1.0, "use_projector": True},
 ]
 
 def model_id_from_cfg(cfg: dict) -> str:
