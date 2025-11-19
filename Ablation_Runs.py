@@ -22,7 +22,6 @@ from torch_geometric.loader import DataLoader
 from Industrial_Pipeline_Functions import IndustrialGraphDataset
 from Industrial_Pipeline_Functions import (
     LightweightIndustrialDiffusion,
-    train_model, validate_constraints                               # <-- sí vive en industrial_diffusion.py
 )
 from tqdm import tqdm
 from random import randint
@@ -37,7 +36,7 @@ from Industrial_Pipeline_Functions import (
 
 
 import networkx as nx
-ROOT_OUT = Path("ablation_runs_11_17_posterior_randomChooseIfInvalid")
+ROOT_OUT = Path("ablation_runs_11_19_for_RL")
 ROOT_OUT.mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,9 +73,9 @@ IPPS_CANVAS = get_ipps_problem_data(problem_workpieces, problem_machines, DEVICE
 
 EPOCHS = 30
 # EPOCHS = 60
-T_STEPS = 100
-N_SAMP  = 300        
-
+T_STEPS = 30
+# N_SAMP  = 300
+N_SAMP  = 50
 
 
 class GraphEncoder(torch.nn.Module):
@@ -220,7 +219,7 @@ def compute_metrics(model, out_dir, ipps_canvas, n_samples=N_SAMP, reuse_samples
     # --- metrics from (possibly reused) samples ---
     hashes = [wl_hash(n_lbls.cpu(), e_mat.cpu()) for (n_lbls, e_mat) in samples]
 
-    data_canvas_cpu = ipps_canvas.to("cpu")  # <-- 修改
+    data_canvas_cpu = ipps_canvas.to("cpu")
     viol = sum(not validate_constraints(e_mat, n_lbls, "cpu", data=data_canvas_cpu)
                for (n_lbls, e_mat) in samples)
 

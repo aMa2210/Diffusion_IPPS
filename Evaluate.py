@@ -246,7 +246,7 @@ def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs):
 if __name__ == "__main__":
     RUN_NAME = "baseline"
     PROBLEM_FILE = "TestSet/1.json"
-    ablation_dir = Path("ablation_runs_11_17_posterior_randomChooseIfInvalid")
+    ablation_dir = Path("ablation_runs_11_17_posterior_randomChooseIfInvalid_classifier_free_guidance_withoutKL")
     samples_path = ablation_dir / RUN_NAME / "samples.pt"
 
     print(f"📂 Loading problem definitions from: {PROBLEM_FILE}")
