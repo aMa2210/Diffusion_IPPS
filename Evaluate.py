@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 from Industrial_Pipeline_Functions import load_ipps_problem_from_json, get_ipps_problem_data
-
+import random
 
 @dataclass
 class Workpiece:
@@ -81,90 +81,132 @@ def calculate_energy_consumption(completed_operations: List[Dict], makespan: flo
 
 def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_data: Dict) -> Tuple[
     Dict, Dict, List[Dict]]:
-    to_process_operations = []
-    workpiece_progress = {}
+    # ==========================================
+    # 1. 解析输入并生成 "固定" 的机器队列
+    # ==========================================
+    all_ops_map = {}
+    machine_queues = {m: [] for m in machine_power_data.keys()}
+    total_ops_count = 0
 
-    for wp_name, selected_machines, processing_times in workpiece_cycles:
-        operations = []
-        for feature_idx, (machine, proc_time) in enumerate(zip(selected_machines, processing_times)):
-            operation = {'workpiece': wp_name, 'feature': feature_idx + 1, 'machine': machine,
-                         'processing_time': proc_time, 'start_time': None, 'end_time': None}
-            operations.append(operation)
-        operations.sort(key=lambda x: x['feature'])
-        to_process_operations.extend(operations)
-        workpiece_progress[wp_name] = {'next_operation_index': 0, 'operations': operations, 'last_end_time': 0}
-
-    machine_ids = list(machine_power_data.keys())
-    machine_status = {m: {'current_operation': None, 'available_from': 0} for m in machine_ids}
-
-    completed_operations = []
-    time = 0
-    max_time = 100000
-
-    while any(progress['next_operation_index'] < len(progress['operations']) for progress in
-              workpiece_progress.values()) and time < max_time:
-        machines_freed = False
-        for machine_id, status in machine_status.items():
-            if status['current_operation'] is not None and status['available_from'] <= time:
-                status['current_operation'] = None
-                machines_freed = True
-
-        assigned_any = False
-        available_operations = []
-        for wp_name, progress in workpiece_progress.items():
-            if progress['next_operation_index'] < len(progress['operations']):
-                operation = progress['operations'][progress['next_operation_index']]
-                if progress['last_end_time'] <= time:
-                    available_operations.append(operation)
-
-        while True:
-            machine_candidates = {m: [] for m in machine_status}
-            for operation in available_operations:
-                mid = operation['machine']
-                if mid in machine_status and machine_status[mid]['current_operation'] is None and machine_status[mid][
-                    'available_from'] <= time:
-                    wp_p = workpiece_progress[operation['workpiece']]
-                    start_t = max(time, wp_p['last_end_time'])
-                    machine_candidates[mid].append((operation, start_t))
-
-            new_assignments = []
-            for mid, candidates in machine_candidates.items():
-                if candidates:
-                    candidates.sort(key=lambda x: (x[1], x[0]['processing_time']))
-                    new_assignments.append((mid, candidates[0][0], candidates[0][1]))
-
-            if not new_assignments: break
-
-            for mid, op, start_t in new_assignments:
-                end_t = start_t + op['processing_time']
-                op['start_time'], op['end_time'] = start_t, end_t
-                machine_status[mid]['current_operation'] = op
-                machine_status[mid]['available_from'] = end_t
-                workpiece_progress[op['workpiece']]['next_operation_index'] += 1
-                workpiece_progress[op['workpiece']]['last_end_time'] = end_t
-                completed_operations.append(copy.deepcopy(op))
-                if op in available_operations: available_operations.remove(op)
-                assigned_any = True
-
-        if not assigned_any and not machines_freed:
-            next_completion = float('inf')
-            for status in machine_status.values():
-                if status['current_operation'] is not None and status['available_from'] < next_completion:
-                    next_completion = status['available_from']
-            if next_completion == float('inf'):
-                next_avail = min(status['available_from'] for status in machine_status.values())
-                time = max(time + 1, next_avail)
-                print('something is wrong')
-            else:
-                time = next_completion
+    for item in workpiece_cycles:
+        if len(item) == 4:
+            wp_name, selected_machines, processing_times, priorities = item
         else:
-            continue
+            wp_name, selected_machines, processing_times = item
+            priorities = [random.random() for _ in range(len(selected_machines))]
 
-    completion_times = {name: p['last_end_time'] for name, p in workpiece_progress.items()}
+        for feature_idx, (mid, proc_time, priority) in enumerate(zip(selected_machines, processing_times, priorities)):
+            current_feat = feature_idx + 1
+            operation = {
+                'workpiece': wp_name,
+                'feature': current_feat,
+                'machine': mid,
+                'processing_time': proc_time,
+                'priority': priority,
+                'start_time': None,
+                'end_time': None
+            }
+
+            # 记录到全局查找表，方便查前置状态
+            all_ops_map[(wp_name, current_feat)] = operation
+
+            if mid in machine_queues:
+                machine_queues[mid].append(operation)
+
+            total_ops_count += 1
+
+    # 核心：预先按优先级排序 (High -> Low)
+    for mid in machine_queues:
+        machine_queues[mid].sort(key=lambda x: (-x['priority'], x['workpiece'], x['feature']))
+
+    # ==========================================
+    # 2. 执行 List Scheduling (允许跳过不可行任务)
+    # ==========================================
+
+    machine_available_time = {m: 0 for m in machine_power_data.keys()}
+    job_available_time = {name: 0 for name in [c[0] for c in workpiece_cycles]}
+    completed_operations = []
+
+    # 安全计数器 (虽然 List Scheduling 不易死锁，但保留以防图结构本身非法)
+    steps = 0
+    max_steps = total_ops_count * 5  # 给多一点宽容度
+
+    while len(completed_operations) < total_ops_count:
+        if steps > max_steps:
+            raise RuntimeError("Simulation stuck! (Possible invalid graph structure or extreme deadlock)")
+
+        progress_made = False
+
+        # 遍历每一台机器
+        for mid in list(machine_queues.keys()):
+            queue = machine_queues[mid]
+            if not queue:
+                continue
+
+            # --- 🚀 核心修改区域 START ---
+
+            target_op_index = -1
+            target_op = None
+
+            # 遍历队列，寻找 *第一个* 满足物理条件 (前置已完成) 的任务
+            for idx, op in enumerate(queue):
+                wp_name = op['workpiece']
+                feat_idx = op['feature']
+
+                # 检查前置工序是否完成
+                is_ready = True
+                if feat_idx > 1:
+                    prev_op_key = (wp_name, feat_idx - 1)
+                    # 如果前置工序的 end_time 还是 None，说明没做完
+                    if all_ops_map[prev_op_key]['end_time'] is None:
+                        is_ready = False
+
+                if is_ready:
+                    # 找到了！这是当前队列中优先级最高且 *能做* 的任务
+                    target_op = op
+                    target_op_index = idx
+                    break  # 停止扫描，锁定这个任务
+
+            # 如果找到了能做的任务，执行它
+            if target_op is not None:
+                op = target_op
+                wp_name = op['workpiece']
+
+                job_ready_t = job_available_time[wp_name]
+                machine_ready_t = machine_available_time[mid]
+
+                # 计算时间 (取最大值：体现了如果机器空闲但工件没来，机器会空转等待)
+                start_t = max(job_ready_t, machine_ready_t)
+                end_t = start_t + op['processing_time']
+
+                # 更新 Operation 状态
+                op['start_time'] = start_t
+                op['end_time'] = end_t
+
+                # 更新全局时钟
+                machine_available_time[mid] = end_t
+                job_available_time[wp_name] = end_t
+
+                # 提交结果
+                completed_operations.append(op)
+
+                # 从队列中移除 (注意是用 index 移除，不仅仅是 pop(0))
+                queue.pop(target_op_index)
+
+                progress_made = True
+
+            # --- 🚀 核心修改区域 END ---
+
+        if not progress_made:
+            steps += 1
+        else:
+            steps = 0
+
+    completion_times = job_available_time
     makespan = max(completion_times.values()) if completion_times else 0
     energy = calculate_energy_consumption(completed_operations, makespan, machine_power_data)
-    return completion_times, energy, completed_operations
 
+    return completion_times, energy, completed_operations
 
 def create_gantt_chart(completed_operations, title="Gantt Chart"):
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -246,7 +288,7 @@ def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs):
 if __name__ == "__main__":
     RUN_NAME = "baseline"
     PROBLEM_FILE = "TestSet/1.json"
-    ablation_dir = Path("ablation_runs_11_17_posterior_randomChooseIfInvalid_classifier_free_guidance_withoutKL")
+    ablation_dir = Path("ablation_runs_11_19_for_RL")
     samples_path = ablation_dir / RUN_NAME / "samples.pt"
 
     print(f"📂 Loading problem definitions from: {PROBLEM_FILE}")

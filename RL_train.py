@@ -27,7 +27,7 @@ T_STEPS = 30
 ENTROPY_START = 0.05
 ENTROPY_END = 0.001
 DECAY_STEPS = 500
-
+T_SCALER = 0.01
 all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
 
 raw_wp_dicts, raw_machines = load_ipps_problem_from_json(PROBLEM_FILE)
@@ -57,7 +57,7 @@ for epoch in range(EPOCHS):
 
     for b in range(BATCH_SIZE):
 
-        generated_edges, log_prob, entropy = model.reverse_diffusion_with_logprob(ipps_canvas, DEVICE)
+        generated_edges, log_prob, entropy = model.reverse_diffusion_with_logprob(ipps_canvas, DEVICE, time_guidance_scale=T_SCALER)
         edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
         is_structurally_valid = validate_constraints(
             edges_matrix,
