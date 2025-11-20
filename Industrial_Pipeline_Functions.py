@@ -511,7 +511,7 @@ def train_model(model, dataloader, optimizer, device, edge_weight, node_marginal
 
        
 class LightweightIndustrialDiffusion(nn.Module):
-    def __init__(self, T=100, hidden_dim=12, beta_start=0.0001, beta_end=0.02, time_embed_dim=16, nhead=4, dropout=0.1, use_projector=True, device=device, edge_dim=1):
+    def __init__(self, T=100, hidden_dim=64, beta_start=0.0001, beta_end=0.02, time_embed_dim=32, nhead=4, dropout=0.1, use_projector=True, device=device, edge_dim=1):
         super().__init__()
         self.device = torch.device(device)  
         self.T = T
@@ -528,11 +528,11 @@ class LightweightIndustrialDiffusion(nn.Module):
         self.transformer1 = TransformerConv(in_channels, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
         self.transformer2 = TransformerConv(hidden_dim, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
         self.node_out = nn.Linear(hidden_dim, self.node_num_classes)
-
+        self.edge_out_dim = self.edge_num_classes + 1 #add a priority dimension
         self.edge_mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, self.edge_num_classes)
+            nn.Linear(hidden_dim, self.edge_out_dim)
         )
         log_Q, log_Q_bar = self._precompute_log_matrices()
         self.register_buffer('log_Q_matrices', log_Q)
@@ -736,67 +736,6 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return final_node_labels, final_edge_labels.unsqueeze(0), intermediate_graphs
 
-    # def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
-    #     """
-    #     For RL sampling specifically
-    #     """
-    #     num_nodes = data.x.size(0)
-    #     x = data.x.clone()
-    #
-    #     seq_edges_src = data.edge_index[0]
-    #     seq_edges_tgt = data.edge_index[1]
-    #     pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
-    #     pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
-    #
-    #     e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
-    #     e[:, :, 0] = 1
-    #     e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
-    #
-    #     total_log_prob = 0.0
-    #     total_entropy = 0.0
-    #     current_node_labels = x.argmax(dim=1)
-    #     allowed_mask = get_ipps_allowed_mask(current_node_labels, data, device)
-    #     forbidden_mask = ~allowed_mask
-    #
-    #     for t in range(self.T - 1, -1, -1):
-    #
-    #         current_edge_labels = e.argmax(dim=-1)
-    #         edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
-    #
-    #         # Forward Pass
-    #         _, edge_logits_list = self.forward(x, edge_index_t, data.batch, t)
-    #
-    #         if edge_logits_list:
-    #             edge_logits = edge_logits_list[0]
-    #
-    #             if hasattr(data, 'time_matrix'):
-    #                 time_penalty = data.time_matrix * time_guidance_scale
-    #                 edge_logits[:, :, 1] -= time_penalty
-    #
-    #
-    #             large_val = 1e9
-    #             edge_logits[:, :, 1][forbidden_mask] = -large_val
-    #             edge_logits[:, :, 0][pinned_edge_mask] = -large_val
-    #             edge_logits[:, :, 1][pinned_edge_mask] = large_val
-    #
-    #             flat_logits = edge_logits.view(-1, self.edge_num_classes)
-    #             probs = F.softmax(flat_logits, dim=-1)
-    #             log_probs = F.log_softmax(flat_logits, dim=-1)
-    #
-    #             step_entropy = -(probs * log_probs).sum(dim=-1).mean()
-    #             total_entropy += step_entropy
-    #
-    #             sampled_flat = torch.multinomial(probs, 1)  # [N*N, 1]
-    #
-    #             selected_log_probs = log_probs.gather(1, sampled_flat)
-    #             step_log_prob = selected_log_probs.sum()
-    #             total_log_prob += step_log_prob
-    #
-    #             # 8. 更新图状态
-    #             e = F.one_hot(sampled_flat.view(num_nodes, num_nodes).long(),
-    #                           num_classes=self.edge_num_classes).float()
-    #
-    #     return e, total_log_prob, total_entropy
     def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
         """
         For RL sampling specifically
@@ -828,12 +767,15 @@ class LightweightIndustrialDiffusion(nn.Module):
             edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
 
             # Forward Pass
-            _, edge_logits_list = self.forward(x, edge_index_t, data.batch, t)
+            _, edge_outputs_list = self.forward(x, edge_index_t, data.batch, t)
 
-            if edge_logits_list:
-
-                edge_logits = edge_logits_list[0]
+            if edge_outputs_list:
+                edge_output = edge_outputs_list[0]
+                # edge_logits = edge_logits_list[0]
+                edge_logits = edge_output[:, :, :2]
                 score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
+                raw_priority = edge_output[:, :, 2]
+                priority_scores = torch.sigmoid(raw_priority)
 
                 if hasattr(data, 'time_matrix'):
                     score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
@@ -853,9 +795,11 @@ class LightweightIndustrialDiffusion(nn.Module):
                 dist = torch.distributions.Categorical(logits=target_scores)
 
                 actions = dist.sample()
+                relevant_priorities = priority_scores[op_indices]
+                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
 
                 step_log_prob = dist.log_prob(actions).sum()
-                step_entropy = dist.entropy().mean()  # 平均熵作为正则化
+                step_entropy = dist.entropy().mean()
 
                 total_log_prob += step_log_prob
                 total_entropy += step_entropy
@@ -866,7 +810,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
 
-        return e, total_log_prob, total_entropy
+        return e, total_log_prob, total_entropy, selected_priorities
     
 
     def generate_global_graph(self, n_nodes):

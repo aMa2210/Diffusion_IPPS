@@ -82,7 +82,7 @@ def calculate_energy_consumption(completed_operations: List[Dict], makespan: flo
 def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_data: Dict) -> Tuple[
     Dict, Dict, List[Dict]]:
     # ==========================================
-    # 1. 解析输入并生成 "固定" 的机器队列
+    # 1. 初始化与严格定序
     # ==========================================
     all_ops_map = {}
     machine_queues = {m: [] for m in machine_power_data.keys()}
@@ -106,102 +106,122 @@ def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_da
                 'start_time': None,
                 'end_time': None
             }
-
-            # 记录到全局查找表，方便查前置状态
             all_ops_map[(wp_name, current_feat)] = operation
-
             if mid in machine_queues:
                 machine_queues[mid].append(operation)
-
             total_ops_count += 1
 
-    # 核心：预先按优先级排序 (High -> Low)
+    # 🔒 严格定序：完全按照 AI 的优先级排队
     for mid in machine_queues:
         machine_queues[mid].sort(key=lambda x: (-x['priority'], x['workpiece'], x['feature']))
 
     # ==========================================
-    # 2. 执行 List Scheduling (允许跳过不可行任务)
+    # 2. 仿真执行 (带死锁恢复)
     # ==========================================
 
     machine_available_time = {m: 0 for m in machine_power_data.keys()}
     job_available_time = {name: 0 for name in [c[0] for c in workpiece_cycles]}
     completed_operations = []
 
-    # 安全计数器 (虽然 List Scheduling 不易死锁，但保留以防图结构本身非法)
-    steps = 0
-    max_steps = total_ops_count * 5  # 给多一点宽容度
-
     while len(completed_operations) < total_ops_count:
-        if steps > max_steps:
-            raise RuntimeError("Simulation stuck! (Possible invalid graph structure or extreme deadlock)")
 
         progress_made = False
 
-        # 遍历每一台机器
+        # --- 🅰️ 阶段 A: 尝试严格执行 (Strict Execution) ---
+        # 遍历每台机器，只检查它的队首 (Queue Head)
         for mid in list(machine_queues.keys()):
             queue = machine_queues[mid]
-            if not queue:
-                continue
+            if not queue: continue
 
-            # --- 🚀 核心修改区域 START ---
+            op = queue[0]  # 只看第一个！
 
-            target_op_index = -1
-            target_op = None
+            # 检查前置条件
+            is_ready = True
+            if op['feature'] > 1:
+                prev_op = all_ops_map[(op['workpiece'], op['feature'] - 1)]
+                if prev_op['end_time'] is None:
+                    is_ready = False
 
-            # 遍历队列，寻找 *第一个* 满足物理条件 (前置已完成) 的任务
-            for idx, op in enumerate(queue):
-                wp_name = op['workpiece']
-                feat_idx = op['feature']
-
-                # 检查前置工序是否完成
-                is_ready = True
-                if feat_idx > 1:
-                    prev_op_key = (wp_name, feat_idx - 1)
-                    # 如果前置工序的 end_time 还是 None，说明没做完
-                    if all_ops_map[prev_op_key]['end_time'] is None:
-                        is_ready = False
-
-                if is_ready:
-                    # 找到了！这是当前队列中优先级最高且 *能做* 的任务
-                    target_op = op
-                    target_op_index = idx
-                    break  # 停止扫描，锁定这个任务
-
-            # 如果找到了能做的任务，执行它
-            if target_op is not None:
-                op = target_op
-                wp_name = op['workpiece']
-
-                job_ready_t = job_available_time[wp_name]
+            if is_ready:
+                # 执行任务
+                job_ready_t = job_available_time[op['workpiece']]
                 machine_ready_t = machine_available_time[mid]
-
-                # 计算时间 (取最大值：体现了如果机器空闲但工件没来，机器会空转等待)
                 start_t = max(job_ready_t, machine_ready_t)
                 end_t = start_t + op['processing_time']
 
-                # 更新 Operation 状态
                 op['start_time'] = start_t
                 op['end_time'] = end_t
-
-                # 更新全局时钟
                 machine_available_time[mid] = end_t
-                job_available_time[wp_name] = end_t
+                job_available_time[op['workpiece']] = end_t
 
-                # 提交结果
                 completed_operations.append(op)
-
-                # 从队列中移除 (注意是用 index 移除，不仅仅是 pop(0))
-                queue.pop(target_op_index)
+                queue.pop(0)  # 移除队首
 
                 progress_made = True
+                # 这里的策略是：一旦有机器动了，系统状态就变了，
+                # 我们立刻重新开始循环，看看这个变动是否解锁了其他机器的队首
+                # (这有助于保持严格顺序)
 
-            # --- 🚀 核心修改区域 END ---
+        if progress_made:
+            continue  # 继续下一轮严格检查
 
-        if not progress_made:
-            steps += 1
+        # --- 🅱️ 阶段 B: 死锁恢复 (Deadlock Recovery) ---
+        # 如果代码走到这里，说明：所有机器的队首任务都卡住了 (progress_made = False)
+        # 这就是死锁。我们需要打破它。
+
+        # 策略：扫描所有队列中的 *非队首* 任务，找到优先级最高的 *可行* 任务插队
+        best_rescue_op = None
+        best_rescue_mid = -1
+        best_rescue_idx = -1
+
+        for mid, queue in machine_queues.items():
+            # 从第2个任务开始看 (因为第1个已经确诊卡住了)
+            for idx, op in enumerate(queue):
+                if idx == 0: continue
+
+                # 检查是否可行
+                is_ready = True
+                if op['feature'] > 1:
+                    prev_op = all_ops_map[(op['workpiece'], op['feature'] - 1)]
+                    if prev_op['end_time'] is None:
+                        is_ready = False
+
+                if is_ready:
+                    # 找到一个能动的！
+                    # 我们挑选 priority 最高的那个来 "救火"
+                    if best_rescue_op is None or op['priority'] > best_rescue_op['priority']:
+                        best_rescue_op = op
+                        best_rescue_mid = mid
+                        best_rescue_idx = idx
+
+        if best_rescue_op:
+            # 🚑 执行救援任务 (插队执行)
+            op = best_rescue_op
+            mid = best_rescue_mid
+
+            # 标准执行逻辑
+            job_ready_t = job_available_time[op['workpiece']]
+            machine_ready_t = machine_available_time[mid]
+            start_t = max(job_ready_t, machine_ready_t)
+            end_t = start_t + op['processing_time']
+
+            op['start_time'] = start_t
+            op['end_time'] = end_t
+            machine_available_time[mid] = end_t
+            job_available_time[op['workpiece']] = end_t
+
+            completed_operations.append(op)
+            machine_queues[mid].pop(best_rescue_idx)  # 从队列中间移除
+
+            # print(f"⚠️ Deadlock resolved by swapping: {op['workpiece']}-F{op['feature']} on Machine {mid}")
+
         else:
-            steps = 0
+            # 如果连救援任务都找不到，说明图本身不连通或有逻辑错误
+            raise RuntimeError("Unresolvable Deadlock! The graph structure might be invalid.")
 
+    # ==========================================
+    # 3. 结算
+    # ==========================================
     completion_times = job_available_time
     makespan = max(completion_times.values()) if completion_times else 0
     energy = calculate_energy_consumption(completed_operations, makespan, machine_power_data)
@@ -230,15 +250,22 @@ def create_gantt_chart(completed_operations, title="Gantt Chart"):
     return plt
 
 
-def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs):
+def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs, priorities_tensor=None):
 
     num_ops = ipps_canvas.op_info.size(0)
     assignments = {}
+    priority_map = {}
 
     for op_node_idx in range(num_ops):
         wp_idx, feat_idx = ipps_canvas.op_info[op_node_idx].tolist()
-        if wp_idx not in assignments: assignments[wp_idx] = {}
-
+        if wp_idx not in assignments:
+            assignments[wp_idx] = {}
+            priority_map[wp_idx] = {}
+        if priorities_tensor is not None:
+            priority_val = priorities_tensor[op_node_idx].item()
+            priority_map[wp_idx][feat_idx] = priority_val
+        else:
+            priority_map[wp_idx][feat_idx] = 0.0
         connected_nodes = edge_matrix[op_node_idx].nonzero(as_tuple=True)[0]
 
         machine_node_idx = -1
@@ -257,13 +284,17 @@ def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs):
 
     for wp_idx, wp_obj in enumerate(all_workpieces_objs):
         wp_assignments = assignments.get(wp_idx, {})
+        wp_priorities_map = priority_map.get(wp_idx, {})
+
         selected_machines = []
         processing_times = []
-
+        current_priorities = []
         num_features = len(wp_obj.optional_machines)
 
         for feat_idx in range(num_features):
             chosen_machine = wp_assignments.get(feat_idx)
+            p_val = wp_priorities_map.get(feat_idx, 0.0)
+            current_priorities.append(p_val)
 
             if chosen_machine is not None:
                 selected_machines.append(chosen_machine)
@@ -279,7 +310,7 @@ def graph_to_simulation_input(edge_matrix, ipps_canvas, all_workpieces_objs):
                 sys.exit(1)
 
 
-        workpiece_cycles.append((wp_obj.name, selected_machines, processing_times))
+        workpiece_cycles.append((wp_obj.name, selected_machines, processing_times, current_priorities))
 
     return workpiece_cycles
 

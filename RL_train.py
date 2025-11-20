@@ -20,9 +20,10 @@ from Evaluate import (
 PROBLEM_FILE = "TestSet/1.json"
 RUN_NAME = "rl_finetuned"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(DEVICE)
 LR = 1e-5   #learning rate
 EPOCHS = 1000
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 T_STEPS = 30
 ENTROPY_START = 0.05
 ENTROPY_END = 0.001
@@ -33,8 +34,9 @@ all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
 raw_wp_dicts, raw_machines = load_ipps_problem_from_json(PROBLEM_FILE)
 ipps_canvas = get_ipps_problem_data(raw_wp_dicts, raw_machines, DEVICE)
 
-model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=12, use_projector=False, device=DEVICE).to(DEVICE)
-model.load_state_dict(torch.load("ablation_runs_11_19_for_RL/baseline/model.pth"))
+model = LightweightIndustrialDiffusion(T=T_STEPS, device=DEVICE).to(DEVICE)
+
+# model.load_state_dict(torch.load("ablation_runs_11_19_for_RL/baseline/model.pth"))
 
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
@@ -57,7 +59,7 @@ for epoch in range(EPOCHS):
 
     for b in range(BATCH_SIZE):
 
-        generated_edges, log_prob, entropy = model.reverse_diffusion_with_logprob(ipps_canvas, DEVICE, time_guidance_scale=T_SCALER)
+        generated_edges, log_prob, entropy, priorities = model.reverse_diffusion_with_logprob(ipps_canvas, DEVICE, time_guidance_scale=T_SCALER)
         edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
         is_structurally_valid = validate_constraints(
             edges_matrix,
@@ -69,7 +71,7 @@ for epoch in range(EPOCHS):
         if not is_structurally_valid:
             raise ValueError("Invalid Graph")
         else:
-            wp_cycles = graph_to_simulation_input(edges_matrix, ipps_canvas, all_workpieces_objs)
+            wp_cycles = graph_to_simulation_input(edges_matrix, ipps_canvas, all_workpieces_objs, priorities)
             _, energy_report, _ = simulate_complete_scheduling(wp_cycles, machine_power_data)
             makespan = energy_report['total']['makespan']
 
