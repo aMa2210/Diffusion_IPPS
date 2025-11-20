@@ -626,95 +626,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return node_logits, edge_logits_list
 
-    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
-        """
-        For RL sampling specifically
-        """
-        num_nodes = data.x.size(0)
-        x = data.x.clone()
 
-        seq_edges_src = data.edge_index[0]
-        seq_edges_tgt = data.edge_index[1]
-        pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
-        pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
-
-        node_types = x.argmax(dim=1)
-        op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
-        machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
-
-        allowed_mask = get_ipps_allowed_mask(node_types, data, device)
-
-        e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
-        e[:, :, 0] = 1
-        e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
-
-        total_log_prob = 0.0
-        total_entropy = 0.0
-
-        for t in range(self.T - 1, -1, -1):
-
-            current_edge_labels = e.argmax(dim=-1)
-            edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
-
-            # Forward Pass
-            tm = data.time_matrix
-            _, edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
-
-            if edge_outputs_list:
-                edge_output = edge_outputs_list[0]
-                # edge_logits = edge_logits_list[0]
-                edge_logits = edge_output[:, :, :2]
-                score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
-                
-                prio_mean = edge_output[:, :, 2]
-                prio_log_std = edge_output[:, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
-                prio_dist = Normal(prio_mean, prio_std)
-                raw_priority_sample = prio_dist.sample() 
-                priority_scores = torch.sigmoid(raw_priority_sample)
-                
-                # priority_scores = torch.sigmoid(raw_priority)
-
-                score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
-
-                new_e_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long, device=device)
-                new_e_indices[pinned_edge_mask] = 1
-
-                op_machine_scores = score_matrix.clone()
-                op_machine_scores[~allowed_mask] = -1e9
-
-                valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
-                valid_col_mask[:, machine_indices] = True
-                op_machine_scores[~valid_col_mask] = -1e9
-
-                target_scores = op_machine_scores[op_indices]  # [Num_Ops, Num_Nodes] prevent machine-machine connections
-
-                dist = torch.distributions.Categorical(logits=target_scores)
-
-                actions = dist.sample()
-                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample) # [N, N]
-                relevant_prio_log_prob = selected_prio_log_prob[op_indices]
-                chosen_prio_log_prob = relevant_prio_log_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-                step_log_prob = dist.log_prob(actions).sum() + chosen_prio_log_prob.sum()
-                
-                relevant_priorities = priority_scores[op_indices]
-                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-                # step_log_prob = dist.log_prob(actions).sum()
-                entropy_routing = dist.entropy().mean()
-                entropy_prio = prio_dist.entropy().mean()
-                
-                step_entropy = entropy_routing + entropy_prio
-                total_log_prob += step_log_prob
-                total_entropy += step_entropy
-
-                new_e_indices[op_indices, actions] = 1
-
-                new_e_indices[pinned_edge_mask] = 1
-                e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
-
-        return e, total_log_prob, total_entropy, selected_priorities
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()
 
@@ -790,6 +702,24 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 edge_probs = F.softmax(edge_logits, dim=-1)
                 flat_probs = edge_probs.view(-1, self.edge_num_classes)
+                # if t in (1, 0):
+                #     found = False
+                #     for attempt in range(max_attempts):
+                #         sampled_flat = torch.multinomial(flat_probs, num_samples=1).view(-1)
+                #         candidate_edge_matrix = sampled_flat.view(num_nodes, num_nodes)
+                #         projected_op_machine = ipps_projector(current_node_labels, candidate_edge_matrix, data, device)
+                #         projected = projected_op_machine
+                #         projected[pinned_edge_mask] = 1
+                #
+                #         if validate_constraints(projected, current_node_labels, device, exact=True, data=data):
+                #             e = F.one_hot(projected.long(), num_classes=self.edge_num_classes).float()
+                #             found = True
+                #             break
+                #
+                #     if not found:
+                #         e = F.one_hot(projected.long(), num_classes=self.edge_num_classes).float()
+                #
+                # else:
                 sampled_flat = torch.multinomial(flat_probs, num_samples=1).view(-1)
                 candidate_edge_matrix = sampled_flat.view(num_nodes, num_nodes)
 
@@ -810,7 +740,96 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return final_node_labels, final_edge_labels.unsqueeze(0), intermediate_graphs
 
-    
+    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
+        """
+        For RL sampling specifically
+        """
+        num_nodes = data.x.size(0)
+        x = data.x.clone()
+
+        seq_edges_src = data.edge_index[0]
+        seq_edges_tgt = data.edge_index[1]
+        pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
+        pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
+
+        node_types = x.argmax(dim=1)
+        op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
+        machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
+
+        allowed_mask = get_ipps_allowed_mask(node_types, data, device)
+
+        e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
+        e[:, :, 0] = 1
+        e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
+
+        total_log_prob = 0.0
+        total_entropy = 0.0
+
+        for t in range(self.T - 1, -1, -1):
+
+            current_edge_labels = e.argmax(dim=-1)
+            edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
+
+            # Forward Pass
+            tm = data.time_matrix
+            _, edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
+
+            if edge_outputs_list:
+                edge_output = edge_outputs_list[0]
+                # edge_logits = edge_logits_list[0]
+                edge_logits = edge_output[:, :, :2]
+                score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
+                
+                prio_mean = edge_output[:, :, 2]
+                prio_log_std = edge_output[:, :, 3]
+                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_dist = Normal(prio_mean, prio_std)
+                raw_priority_sample = prio_dist.sample() 
+                priority_scores = torch.sigmoid(raw_priority_sample)
+                
+                # priority_scores = torch.sigmoid(raw_priority)
+
+                if hasattr(data, 'time_matrix'):
+                    score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
+
+                new_e_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long, device=device)
+                new_e_indices[pinned_edge_mask] = 1
+
+                op_machine_scores = score_matrix.clone()
+                op_machine_scores[~allowed_mask] = -1e9
+
+                valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
+                valid_col_mask[:, machine_indices] = True
+                op_machine_scores[~valid_col_mask] = -1e9
+
+                target_scores = op_machine_scores[op_indices]  # [Num_Ops, Num_Nodes] prevent machine-machine connections
+
+                dist = torch.distributions.Categorical(logits=target_scores)
+
+                actions = dist.sample()
+                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample) # [N, N]
+                relevant_prio_log_prob = selected_prio_log_prob[op_indices]
+                chosen_prio_log_prob = relevant_prio_log_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+                step_log_prob = dist.log_prob(actions).sum() + chosen_prio_log_prob.sum()
+                
+                relevant_priorities = priority_scores[op_indices]
+                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+                # step_log_prob = dist.log_prob(actions).sum()
+                entropy_routing = dist.entropy().mean()
+                entropy_prio = prio_dist.entropy().mean()
+                
+                step_entropy = entropy_routing + entropy_prio
+                total_log_prob += step_log_prob
+                total_entropy += step_entropy
+
+                new_e_indices[op_indices, actions] = 1
+
+                new_e_indices[pinned_edge_mask] = 1
+                e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
+
+        return e, total_log_prob, total_entropy, selected_priorities
     
 
     def generate_global_graph(self, n_nodes):
