@@ -203,11 +203,53 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
             time_matrix[i, machine_graph_idx] = t_val / max_time
 
 
+    # op_labels = torch.full((num_ops,), 0, dtype=torch.long)
+    # machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
+    # all_labels = torch.cat([op_labels, machine_labels])
+    # x = F.one_hot(all_labels, num_classes=2).float().to(device)
     op_labels = torch.full((num_ops,), 0, dtype=torch.long)
     machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
-    all_labels = torch.cat([op_labels, machine_labels])
-    x = F.one_hot(all_labels, num_classes=2).float().to(device)
+    all_labels = torch.cat([op_labels, machine_labels]).to(device)
+    type_onehot = F.one_hot(all_labels, num_classes=2).float()
+    
+    # Position, Workload, Connectivity
+    extra_feats = torch.zeros((num_nodes, 3), device=device) 
 
+    extra_feats[num_ops:, 0] = -1.0 
+    
+    for i in range(num_ops): # step number
+        wp_idx, feat_idx = op_info_list[i]
+        total_feats = len(problem_workpieces[wp_idx]["optional_machines"])
+        if total_feats > 1:  # to prevent there is only one step
+            norm_pos = feat_idx / (total_feats - 1)
+        else:
+            norm_pos = 0.0
+        extra_feats[i, 0] = norm_pos
+
+    # extract Op-Machine sub matrix
+    sub_matrix = time_matrix[:num_ops, num_ops:]
+    
+    # connection for every op
+    op_conn = (sub_matrix > 0).float().sum(dim=1)
+    # average process time for every op
+    op_load = sub_matrix.sum(dim=1) / op_conn.clamp(min=1.0)
+    
+    # how many operations can be processed in this machine
+    m_conn = (sub_matrix > 0).float().sum(dim=0)
+    # average process time for every machine
+    m_load = sub_matrix.sum(dim=0) / m_conn.clamp(min=1.0)
+
+
+    # Op Features 0. type 1. average processtime 2.
+    extra_feats[:num_ops, 1] = op_load  # Workload
+    extra_feats[:num_ops, 2] = op_conn / num_machines # Connectivity (归一化)
+    
+    extra_feats[num_ops:, 1] = m_load   # Workload
+    extra_feats[num_ops:, 2] = m_conn / num_ops # Connectivity (归一化)
+
+    # x shape: [Num_Nodes, 2 + 3] = [Num_Nodes, 5]
+    x = torch.cat([type_onehot, extra_feats], dim=1)
+    
     op_info = torch.tensor(op_info_list, dtype=torch.long).to(device)
     machine_map = torch.tensor(problem_machines, dtype=torch.long).to(device)
 
@@ -544,15 +586,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-# ----------------------------------------------------------------
-# 2. 核心组件：带有 AdaLN 的残差 GNN 块 (DiT Style)
-# ----------------------------------------------------------------
 class ResGNNBlock(nn.Module):
-    """
-    受到 Diffusion Transformers (DiT) 启发的残差块。
-    使用 Adaptive Layer Norm (AdaLN) 注入时间信息 t。
-    """
-
     def __init__(self, hidden_dim, heads=4, dropout=0.1, edge_dim=1):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)  # Affine由AdaLN处理
@@ -602,7 +636,7 @@ class ResGNNBlock(nn.Module):
 # 3. 主模型：ComplexIndustrialDiffusion
 # ----------------------------------------------------------------
 class LightweightIndustrialDiffusion(nn.Module):
-    def __init__(self, T=100, input_dim=2, hidden_dim=128, num_layers=6,
+    def __init__(self, T=100, input_dim=5, hidden_dim=128, num_layers=6,
                  beta_start=0.0001, beta_end=0.02, nhead=4, dropout=0.1,
                  device='cuda', edge_dim=1):
         super().__init__()
@@ -610,7 +644,6 @@ class LightweightIndustrialDiffusion(nn.Module):
         self.T = T
         self.hidden_dim = hidden_dim
 
-        # Beta Schedule (保持不变)
         self.beta_schedule = torch.linspace(beta_start, beta_end, T)
         self.alpha = 1 - self.beta_schedule
         self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
@@ -634,7 +667,7 @@ class LightweightIndustrialDiffusion(nn.Module):
         ))
 
         # Output Heads
-        self.node_out = nn.Linear(hidden_dim, 2)  # Node Class
+        # self.node_out = nn.Linear(hidden_dim, 2)  # Node Class
 
         # 增强的 Edge Decoder (Bilinear or Deeper MLP)
         self.edge_num_classes = 2
@@ -665,7 +698,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             edge_times = time_matrix[src, dst].unsqueeze(-1)
             edge_attr = self.edge_encoder(edge_times)
         else:
-            # 默认 edge attr
+            print('no time metrix!!!')
             edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
             edge_attr = self.edge_encoder(edge_attr)
 
@@ -675,7 +708,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             h = layer(h, t_emb_node, edge_index, edge_attr)
 
         # 3. Output Heads
-        node_logits = self.node_out(h)
+        # node_logits = self.node_out(h)
 
         # 4. Dense Edge Prediction with Global Context
         h_dense, mask = to_dense_batch(h, batch)  # [Batch, Max_Nodes, Hidden]
@@ -700,7 +733,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             edge_logits = self.edge_mlp(pair_embed)
             edge_logits_list.append(edge_logits)
 
-        return node_logits, edge_logits_list
+        return edge_logits_list
 # class LightweightIndustrialDiffusion(nn.Module):
 #     def __init__(self, T=100, hidden_dim=64, beta_start=0.0001, beta_end=0.02, time_embed_dim=32, nhead=4, dropout=0.1, use_projector=True, device=device, edge_dim=1):
 #         super().__init__()
@@ -849,7 +882,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
             # Forward Pass
             tm = data.time_matrix
-            _, edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
+            edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
 
             if edge_outputs_list:
                 edge_output = edge_outputs_list[0]
@@ -906,6 +939,7 @@ class LightweightIndustrialDiffusion(nn.Module):
                 e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
 
         return e, total_log_prob, total_entropy, selected_priorities
+    
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()
 

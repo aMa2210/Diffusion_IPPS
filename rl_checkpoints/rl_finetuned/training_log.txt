@@ -1,0 +1,10 @@
+Training Log for rl_finetuned
+==================================================
+Epoch 0 | Loss: -445.23 | Avg Makespan: 151.5 | Best: 141.0 | Baseline: 151.5
+Epoch 1 | Loss: -394.20 | Avg Makespan: 160.5 | Best: 156.0 | Baseline: 152.4
+Epoch 2 | Loss: -341.46 | Avg Makespan: 153.0 | Best: 142.0 | Baseline: 152.5
+Epoch 3 | Loss: -356.46 | Avg Makespan: 155.0 | Best: 150.0 | Baseline: 152.7
+Epoch 4 | Loss: -156.68 | Avg Makespan: 154.2 | Best: 140.0 | Baseline: 152.9
+Epoch 5 | Loss: -424.16 | Avg Makespan: 150.2 | Best: 144.0 | Baseline: 152.6
+Epoch 6 | Loss: -685.40 | Avg Makespan: 146.2 | Best: 142.0 | Baseline: 152.0
+Epoch 7 | Loss: -575.61 | Avg Makespan: 136.2 | Best: 129.0 | Baseline: 150.4

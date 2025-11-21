@@ -9,7 +9,7 @@ from torch_geometric.data import InMemoryDataset, Data
 import json
 import random
 from torch.distributions import Normal
-
+from torch_geometric.nn import TransformerConv, GlobalAttention
 
 class IndustrialGraphDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
@@ -203,11 +203,53 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
             time_matrix[i, machine_graph_idx] = t_val / max_time
 
 
+    # op_labels = torch.full((num_ops,), 0, dtype=torch.long)
+    # machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
+    # all_labels = torch.cat([op_labels, machine_labels])
+    # x = F.one_hot(all_labels, num_classes=2).float().to(device)
     op_labels = torch.full((num_ops,), 0, dtype=torch.long)
     machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
-    all_labels = torch.cat([op_labels, machine_labels])
-    x = F.one_hot(all_labels, num_classes=2).float().to(device)
+    all_labels = torch.cat([op_labels, machine_labels]).to(device)
+    type_onehot = F.one_hot(all_labels, num_classes=2).float()
+    
+    # Position, Workload, Connectivity
+    extra_feats = torch.zeros((num_nodes, 3), device=device) 
 
+    extra_feats[num_ops:, 0] = -1.0 
+    
+    for i in range(num_ops): # step number
+        wp_idx, feat_idx = op_info_list[i]
+        total_feats = len(problem_workpieces[wp_idx]["optional_machines"])
+        if total_feats > 1:  # to prevent there is only one step
+            norm_pos = feat_idx / (total_feats - 1)
+        else:
+            norm_pos = 0.0
+        extra_feats[i, 0] = norm_pos
+
+    # extract Op-Machine sub matrix
+    sub_matrix = time_matrix[:num_ops, num_ops:]
+    
+    # connection for every op
+    op_conn = (sub_matrix > 0).float().sum(dim=1)
+    # average process time for every op
+    op_load = sub_matrix.sum(dim=1) / op_conn.clamp(min=1.0)
+    
+    # how many operations can be processed in this machine
+    m_conn = (sub_matrix > 0).float().sum(dim=0)
+    # average process time for every machine
+    m_load = sub_matrix.sum(dim=0) / m_conn.clamp(min=1.0)
+
+
+    # Op Features 0. type 1. average processtime 2.
+    extra_feats[:num_ops, 1] = op_load  # Workload
+    extra_feats[:num_ops, 2] = op_conn / num_machines # Connectivity (归一化)
+    
+    extra_feats[num_ops:, 1] = m_load   # Workload
+    extra_feats[num_ops:, 2] = m_conn / num_ops # Connectivity (归一化)
+
+    # x shape: [Num_Nodes, 2 + 3] = [Num_Nodes, 5]
+    x = torch.cat([type_onehot, extra_feats], dim=1)
+    
     op_info = torch.tensor(op_info_list, dtype=torch.long).to(device)
     machine_map = torch.tensor(problem_machines, dtype=torch.long).to(device)
 
@@ -509,34 +551,216 @@ def train_model(model, dataloader, optimizer, device, edge_weight, node_marginal
             total_loss += loss.item()
         print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
 
-       
-class LightweightIndustrialDiffusion(nn.Module):
-    def __init__(self, T=100, hidden_dim=64, beta_start=0.0001, beta_end=0.02, time_embed_dim=32, nhead=4, dropout=0.1, use_projector=True, device=device, edge_dim=1):
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_dim, frequency_embedding_size=256):
         super().__init__()
-        self.device = torch.device(device)  
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+        :param dim: the dimension of the output.
+        :return: an (N, dim) Tensor of positional embeddings.
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(max_period)) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class ResGNNBlock(nn.Module):
+    def __init__(self, hidden_dim, heads=4, dropout=0.1, edge_dim=1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)  # Affine由AdaLN处理
+        self.attn = TransformerConv(hidden_dim, hidden_dim // heads, heads=heads,
+                                    concat=True, dropout=dropout, edge_dim=edge_dim)
+
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Dropout(dropout)
+        )
+
+        # AdaLN Modulation: 预测 (scale, shift) x 2 (for norm1 and norm2)
+        # 输入是 time_emb，输出是 4 * hidden_dim 参数
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4 * hidden_dim)
+        )
+
+    def forward(self, x, t_emb, edge_index, edge_attr):
+        # 1. 计算 AdaLN 参数
+        scale_shift = self.adaLN_modulation(t_emb)  # [Batch, 4*Dim] -> 需要扩展到 [Num_Nodes, 4*Dim]
+
+        # 处理 Batch 维度对齐问题 (Graph Batching 中 x 是堆叠的)
+        # 假设 t_emb 已经根据 batch 扩展好了 或者在这里进行 gather
+        # 简单起见，假设传入 forward 的 t_emb 已经是 [Num_Nodes, Dim]
+
+        shift_msa, scale_msa, shift_mlp, scale_mlp = scale_shift.chunk(4, dim=1)
+
+        # 2. Attention Block (Pre-Norm + Residual)
+        x_norm = self.norm1(x) * (1 + scale_msa) + shift_msa
+        x_attn = self.attn(x_norm, edge_index, edge_attr)
+        x = x + x_attn  # Residual
+
+        # 3. FFN Block (Pre-Norm + Residual)
+        x_norm = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+        x_ffn = self.ffn(x_norm)
+        x = x + x_ffn  # Residual
+
+        return x
+
+
+# ----------------------------------------------------------------
+# 3. 主模型：ComplexIndustrialDiffusion
+# ----------------------------------------------------------------
+class LightweightIndustrialDiffusion(nn.Module):
+    def __init__(self, T=100, input_dim=5, hidden_dim=128, num_layers=6,
+                 beta_start=0.0001, beta_end=0.02, nhead=4, dropout=0.1,
+                 device='cuda', edge_dim=1):
+        super().__init__()
+        self.device = torch.device(device)
         self.T = T
+        self.hidden_dim = hidden_dim
+
         self.beta_schedule = torch.linspace(beta_start, beta_end, T)
         self.alpha = 1 - self.beta_schedule
         self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
-        self.use_projector = use_projector
-    
-        self.node_num_classes = 2  # operation machine
-        self.edge_num_classes = 2
 
-        self.time_linear = nn.Linear(time_embed_dim, time_embed_dim)
-        in_channels = self.node_num_classes + time_embed_dim
-        self.transformer1 = TransformerConv(in_channels, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
-        self.transformer2 = TransformerConv(hidden_dim, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
-        self.node_out = nn.Linear(hidden_dim, self.node_num_classes)
-        self.edge_out_dim = self.edge_num_classes + 2  #0:NoEdge, 1:Edge, 2:Prio_Mean, 3:Prio_LogStd
+        # Input Projection
+        self.node_encoder = nn.Linear(input_dim, hidden_dim)
+        self.edge_encoder = nn.Linear(1, edge_dim)  # 如果 edge_attr 只是时间
+
+        # Time Embedding
+        self.time_embedder = TimestepEmbedder(hidden_dim)
+
+        # Backbone: Stack of ResGNNBlocks
+        self.layers = nn.ModuleList([
+            ResGNNBlock(hidden_dim, heads=nhead, dropout=dropout, edge_dim=edge_dim)
+            for _ in range(num_layers)  # 加深到 num_layers 层
+        ])
+
+        # Global Pooling (用于提取图级别的上下文信息)
+        self.global_pool = GlobalAttention(nn.Sequential(
+            nn.Linear(hidden_dim, 1), nn.Sigmoid()
+        ))
+
+        # Output Heads
+        # self.node_out = nn.Linear(hidden_dim, 2)  # Node Class
+
+        # 增强的 Edge Decoder (Bilinear or Deeper MLP)
+        self.edge_num_classes = 2
+        self.edge_out_dim = self.edge_num_classes + 2
+
+        # 这里使用一个 Bilinear 层来增强节点对之间的交互建模
+        self.bilinear = nn.Bilinear(hidden_dim, hidden_dim, hidden_dim)
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
             nn.Linear(hidden_dim, self.edge_out_dim)
         )
-        log_Q, log_Q_bar = self._precompute_log_matrices()
-        self.register_buffer('log_Q_matrices', log_Q)
-        self.register_buffer('log_Q_bar_matrices', log_Q_bar)
+
+    def forward(self, x, edge_index, batch, t, time_matrix=None):
+        # 1. Embedding Inputs
+        # x shape: [Num_Nodes, Feature_Dim] (One-hot or similar)
+        h = self.node_encoder(x.float())
+
+        # Time Embedding
+        t_tensor = torch.tensor([t], dtype=torch.float, device=x.device)
+        t_emb = self.time_embedder(t_tensor)  # [1, Hidden]
+        # 将 t_emb 扩展到每个节点: [Num_Nodes, Hidden]
+        t_emb_node = t_emb.repeat(h.size(0), 1)
+
+        # Edge Attributes 处理
+        if time_matrix is not None:
+            src, dst = edge_index
+            edge_times = time_matrix[src, dst].unsqueeze(-1)
+            edge_attr = self.edge_encoder(edge_times)
+        else:
+            print('no time metrix!!!')
+            edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
+            edge_attr = self.edge_encoder(edge_attr)
+
+        # 2. Backbone Processing
+        for layer in self.layers:
+            # 传入 t_emb_node 用于 AdaLN
+            h = layer(h, t_emb_node, edge_index, edge_attr)
+
+        # 3. Output Heads
+        # node_logits = self.node_out(h)
+
+        # 4. Dense Edge Prediction with Global Context
+        h_dense, mask = to_dense_batch(h, batch)  # [Batch, Max_Nodes, Hidden]
+        batch_size, max_nodes, _ = h_dense.shape
+
+        edge_logits_list = []
+
+        for i in range(batch_size):
+            num_nodes = int(mask[i].sum().item())
+            h_i = h_dense[i, :num_nodes, :]  # [N, Hidden]
+
+            # 显式构建节点对:
+            # src: [N, N, Hidden], dst: [N, N, Hidden]
+            h_src = h_i.unsqueeze(1).expand(-1, num_nodes, -1)
+            h_dst = h_i.unsqueeze(0).expand(num_nodes, -1, -1)
+
+            # 使用 Bilinear Layer 捕捉更强的交互: src^T * W * dst + b
+            # [N, N, Hidden]
+            pair_embed = self.bilinear(h_src, h_dst)
+
+            # Final projection
+            edge_logits = self.edge_mlp(pair_embed)
+            edge_logits_list.append(edge_logits)
+
+        return edge_logits_list
+# class LightweightIndustrialDiffusion(nn.Module):
+#     def __init__(self, T=100, hidden_dim=64, beta_start=0.0001, beta_end=0.02, time_embed_dim=32, nhead=4, dropout=0.1, use_projector=True, device=device, edge_dim=1):
+#         super().__init__()
+#         self.device = torch.device(device)
+#         self.T = T
+#         self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+#         self.alpha = 1 - self.beta_schedule
+#         self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+#         self.use_projector = use_projector
+#
+#         self.node_num_classes = 2  # operation machine
+#         self.edge_num_classes = 2
+#
+#         self.time_linear = nn.Linear(time_embed_dim, time_embed_dim)
+#         in_channels = self.node_num_classes + time_embed_dim
+#         self.transformer1 = TransformerConv(in_channels, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
+#         self.transformer2 = TransformerConv(hidden_dim, hidden_dim, heads=nhead, concat=False, dropout=dropout, edge_dim=edge_dim)
+#         self.node_out = nn.Linear(hidden_dim, self.node_num_classes)
+#         self.edge_out_dim = self.edge_num_classes + 2  #0:NoEdge, 1:Edge, 2:Prio_Mean, 3:Prio_LogStd
+#         self.edge_mlp = nn.Sequential(
+#             nn.Linear(2 * hidden_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, self.edge_out_dim)
+#         )
+#         log_Q, log_Q_bar = self._precompute_log_matrices()
+#         self.register_buffer('log_Q_matrices', log_Q)
+#         self.register_buffer('log_Q_bar_matrices', log_Q_bar)
 
     def _precompute_log_matrices(self):
 
@@ -597,36 +821,125 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return log_logits
 
-    def forward(self, x, edge_index, batch, t, time_matrix=None):
-        t_tensor = torch.tensor([t], dtype=torch.float, device=x.device) / self.T
-        t_embed = get_sinusoidal_embedding(t_tensor, self.time_linear.in_features)
-        t_embed = self.time_linear(t_embed).repeat(x.size(0), 1)
+    # def forward(self, x, edge_index, batch, t, time_matrix=None):
+    #     t_tensor = torch.tensor([t], dtype=torch.float, device=x.device) / self.T
+    #     t_embed = get_sinusoidal_embedding(t_tensor, self.time_linear.in_features)
+    #     t_embed = self.time_linear(t_embed).repeat(x.size(0), 1)
+    #
+    #     x_input = torch.cat([x, t_embed], dim=1)
+    #     if time_matrix is not None:
+    #         src, dst = edge_index
+    #         edge_times = time_matrix[src, dst].unsqueeze(-1) # 变成 [Num_Edges, 1]
+    #         edge_attr = edge_times
+    #     elif edge_attr is None:
+    #         edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
+    #
+    #     h = F.relu(self.transformer1(x_input, edge_index, edge_attr))
+    #     h = F.relu(self.transformer2(h, edge_index, edge_attr))
+    #     node_logits = self.node_out(h)
+    #
+    #     h_dense, mask = to_dense_batch(h, batch)
+    #     batch_size, max_nodes, _ = h_dense.shape
+    #     edge_logits_list = []
+    #     for i in range(batch_size):
+    #         num_nodes = int(mask[i].sum().item())
+    #         h_i = h_dense[i, :num_nodes, :]
+    #         edge_input = torch.cat([h_i.unsqueeze(1).expand(-1, num_nodes, -1), h_i.unsqueeze(0).expand(num_nodes, -1, -1)], dim=-1)
+    #         edge_logits = self.edge_mlp(edge_input)
+    #         edge_logits_list.append(edge_logits)
+    #
+    #     return node_logits, edge_logits_list
 
-        x_input = torch.cat([x, t_embed], dim=1)
-        if time_matrix is not None:
-            src, dst = edge_index
-            edge_times = time_matrix[src, dst].unsqueeze(-1) # 变成 [Num_Edges, 1]
-            edge_attr = edge_times
-        elif edge_attr is None:
-            edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
+    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
+        """
+        For RL sampling specifically
+        """
+        num_nodes = data.x.size(0)
+        x = data.x.clone()
 
-        h = F.relu(self.transformer1(x_input, edge_index, edge_attr))
-        h = F.relu(self.transformer2(h, edge_index, edge_attr))
-        node_logits = self.node_out(h)
+        seq_edges_src = data.edge_index[0]
+        seq_edges_tgt = data.edge_index[1]
+        pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
+        pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
 
-        h_dense, mask = to_dense_batch(h, batch)
-        batch_size, max_nodes, _ = h_dense.shape
-        edge_logits_list = []
-        for i in range(batch_size):
-            num_nodes = int(mask[i].sum().item())
-            h_i = h_dense[i, :num_nodes, :]
-            edge_input = torch.cat([h_i.unsqueeze(1).expand(-1, num_nodes, -1), h_i.unsqueeze(0).expand(num_nodes, -1, -1)], dim=-1)
-            edge_logits = self.edge_mlp(edge_input)
-            edge_logits_list.append(edge_logits)
+        node_types = x.argmax(dim=1)
+        op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
+        machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
 
-        return node_logits, edge_logits_list
+        allowed_mask = get_ipps_allowed_mask(node_types, data, device)
 
+        e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
+        e[:, :, 0] = 1
+        e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
 
+        total_log_prob = 0.0
+        total_entropy = 0.0
+
+        for t in range(self.T - 1, -1, -1):
+
+            current_edge_labels = e.argmax(dim=-1)
+            edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
+
+            # Forward Pass
+            tm = data.time_matrix
+            edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
+
+            if edge_outputs_list:
+                edge_output = edge_outputs_list[0]
+                # edge_logits = edge_logits_list[0]
+                edge_logits = edge_output[:, :, :2]
+                score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
+                
+                prio_mean = edge_output[:, :, 2]
+                prio_log_std = edge_output[:, :, 3]
+                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_dist = Normal(prio_mean, prio_std)
+                raw_priority_sample = prio_dist.sample() 
+                priority_scores = torch.sigmoid(raw_priority_sample)
+                
+                # priority_scores = torch.sigmoid(raw_priority)
+
+                score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
+
+                new_e_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long, device=device)
+                new_e_indices[pinned_edge_mask] = 1
+
+                op_machine_scores = score_matrix.clone()
+                op_machine_scores[~allowed_mask] = -1e9
+
+                valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
+                valid_col_mask[:, machine_indices] = True
+                op_machine_scores[~valid_col_mask] = -1e9
+
+                target_scores = op_machine_scores[op_indices]  # [Num_Ops, Num_Nodes] prevent machine-machine connections
+
+                dist = torch.distributions.Categorical(logits=target_scores)
+
+                actions = dist.sample()
+                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample) # [N, N]
+                relevant_prio_log_prob = selected_prio_log_prob[op_indices]
+                chosen_prio_log_prob = relevant_prio_log_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+                step_log_prob = dist.log_prob(actions).sum() + chosen_prio_log_prob.sum()
+                
+                relevant_priorities = priority_scores[op_indices]
+                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+                # step_log_prob = dist.log_prob(actions).sum()
+                entropy_routing = dist.entropy().mean()
+                entropy_prio = prio_dist.entropy().mean()
+                
+                step_entropy = entropy_routing + entropy_prio
+                total_log_prob += step_log_prob
+                total_entropy += step_entropy
+
+                new_e_indices[op_indices, actions] = 1
+
+                new_e_indices[pinned_edge_mask] = 1
+                e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
+
+        return e, total_log_prob, total_entropy, selected_priorities
+    
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()
 
@@ -702,24 +1015,6 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 edge_probs = F.softmax(edge_logits, dim=-1)
                 flat_probs = edge_probs.view(-1, self.edge_num_classes)
-                # if t in (1, 0):
-                #     found = False
-                #     for attempt in range(max_attempts):
-                #         sampled_flat = torch.multinomial(flat_probs, num_samples=1).view(-1)
-                #         candidate_edge_matrix = sampled_flat.view(num_nodes, num_nodes)
-                #         projected_op_machine = ipps_projector(current_node_labels, candidate_edge_matrix, data, device)
-                #         projected = projected_op_machine
-                #         projected[pinned_edge_mask] = 1
-                #
-                #         if validate_constraints(projected, current_node_labels, device, exact=True, data=data):
-                #             e = F.one_hot(projected.long(), num_classes=self.edge_num_classes).float()
-                #             found = True
-                #             break
-                #
-                #     if not found:
-                #         e = F.one_hot(projected.long(), num_classes=self.edge_num_classes).float()
-                #
-                # else:
                 sampled_flat = torch.multinomial(flat_probs, num_samples=1).view(-1)
                 candidate_edge_matrix = sampled_flat.view(num_nodes, num_nodes)
 
@@ -740,96 +1035,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return final_node_labels, final_edge_labels.unsqueeze(0), intermediate_graphs
 
-    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
-        """
-        For RL sampling specifically
-        """
-        num_nodes = data.x.size(0)
-        x = data.x.clone()
-
-        seq_edges_src = data.edge_index[0]
-        seq_edges_tgt = data.edge_index[1]
-        pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
-        pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
-
-        node_types = x.argmax(dim=1)
-        op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
-        machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
-
-        allowed_mask = get_ipps_allowed_mask(node_types, data, device)
-
-        e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
-        e[:, :, 0] = 1
-        e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
-
-        total_log_prob = 0.0
-        total_entropy = 0.0
-
-        for t in range(self.T - 1, -1, -1):
-
-            current_edge_labels = e.argmax(dim=-1)
-            edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
-
-            # Forward Pass
-            tm = data.time_matrix
-            _, edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
-
-            if edge_outputs_list:
-                edge_output = edge_outputs_list[0]
-                # edge_logits = edge_logits_list[0]
-                edge_logits = edge_output[:, :, :2]
-                score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
-                
-                prio_mean = edge_output[:, :, 2]
-                prio_log_std = edge_output[:, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
-                prio_dist = Normal(prio_mean, prio_std)
-                raw_priority_sample = prio_dist.sample() 
-                priority_scores = torch.sigmoid(raw_priority_sample)
-                
-                # priority_scores = torch.sigmoid(raw_priority)
-
-                if hasattr(data, 'time_matrix'):
-                    score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
-
-                new_e_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long, device=device)
-                new_e_indices[pinned_edge_mask] = 1
-
-                op_machine_scores = score_matrix.clone()
-                op_machine_scores[~allowed_mask] = -1e9
-
-                valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
-                valid_col_mask[:, machine_indices] = True
-                op_machine_scores[~valid_col_mask] = -1e9
-
-                target_scores = op_machine_scores[op_indices]  # [Num_Ops, Num_Nodes] prevent machine-machine connections
-
-                dist = torch.distributions.Categorical(logits=target_scores)
-
-                actions = dist.sample()
-                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample) # [N, N]
-                relevant_prio_log_prob = selected_prio_log_prob[op_indices]
-                chosen_prio_log_prob = relevant_prio_log_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-                step_log_prob = dist.log_prob(actions).sum() + chosen_prio_log_prob.sum()
-                
-                relevant_priorities = priority_scores[op_indices]
-                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-                # step_log_prob = dist.log_prob(actions).sum()
-                entropy_routing = dist.entropy().mean()
-                entropy_prio = prio_dist.entropy().mean()
-                
-                step_entropy = entropy_routing + entropy_prio
-                total_log_prob += step_log_prob
-                total_entropy += step_entropy
-
-                new_e_indices[op_indices, actions] = 1
-
-                new_e_indices[pinned_edge_mask] = 1
-                e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
-
-        return e, total_log_prob, total_entropy, selected_priorities
+    
     
 
     def generate_global_graph(self, n_nodes):
