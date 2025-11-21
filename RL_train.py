@@ -35,7 +35,7 @@ all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
 raw_wp_dicts, raw_machines = load_ipps_problem_from_json(PROBLEM_FILE)
 ipps_canvas = get_ipps_problem_data(raw_wp_dicts, raw_machines, DEVICE)
 
-model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=128, device=DEVICE).to(DEVICE)
+model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=128, num_layers=6, nhead=4, dropout=0.1,device=DEVICE).to(DEVICE)
 
 # model.load_state_dict(torch.load("ablation_runs_11_19_for_RL/baseline/model.pth"))
 
