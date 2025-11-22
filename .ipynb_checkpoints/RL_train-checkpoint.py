@@ -21,16 +21,16 @@ PROBLEM_FILE = "TestSet/1.json"
 RUN_NAME = "rl_finetuned"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-LR = 1e-6   #learning rate
-EPOCHS = 1000
-BATCH_SIZE = 16
-T_STEPS = 8
+LR = 1e-5   #learning rate
+EPOCHS = 2000
+BATCH_SIZE = 32
+T_STEPS = 2
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
 ENTROPY_START = 0.1
 ENTROPY_END = 0.01
-DECAY_STEPS = 200
+DECAY_STEPS = 300
 T_SCALER = 0.01
 
 all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
@@ -43,6 +43,8 @@ model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=256, num_layers=6, 
 # model.load_state_dict(torch.load("ablation_runs_11_19_for_RL/baseline/model.pth"))
 
 optimizer = optim.Adam(model.parameters(), lr=LR)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
+
 global_best_makespan = float('inf')
 moving_avg_makespan = 0
 
@@ -97,17 +99,26 @@ for epoch in range(EPOCHS):
 
     # current_avg_makespan = np.mean(batch_makespans)
     sorted_makespans = np.sort(batch_makespans)
-    current_avg_makespan = np.mean(sorted_makespans[:4])
+    current_elite_avg = np.mean(sorted_makespans[:4])
     batch_mean = np.mean(batch_makespans)
-
-    raw_advantages = np.array([batch_mean - ms for ms in batch_makespans])
+    
+    if epoch == 0: 
+        moving_avg_makespan = batch_mean
+            
+    
+    
+    adv_local = batch_mean - np.array(batch_makespans)
+    adv_global = moving_avg_makespan - np.array(batch_makespans)
+    raw_advantages = 0.5 * adv_local + 0.5 * adv_global
     advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
-    # if advantages.std() > 1e-8:
-    #     advantages = advantages / (advantages.std() + 1e-8)
-    if epoch == 0:
-        moving_avg_makespan = current_avg_makespan
-
-
+    
+    # raw_advantages = np.array([batch_mean - ms for ms in batch_makespans])
+    # advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
+    if advantages.std() > 1e-8:
+        advantages = advantages / (advantages.std() + 1e-8)
+    advantages = torch.clamp(advantages, min=-5.0, max=5.0)
+    
+    moving_avg_makespan = 0.9 * moving_avg_makespan + 0.1 * batch_mean
     # raw_advantages = np.array([moving_avg_makespan - ms for ms in batch_makespans])
     # advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
 
@@ -121,13 +132,11 @@ for epoch in range(EPOCHS):
     selected_log_probs = batch_log_probs_tensor[topk_indices]
     selected_advantages = advantages[topk_indices]
     selected_entropies = batch_entropies_tensor[topk_indices]
-
-    if selected_advantages.std() > 1e-8:
-        selected_advantages = (selected_advantages) / (selected_advantages.std() + 1e-8)
-
-    # --- 计算 Loss (仅针对 Top-K) ---
-    loss_policy = 0
-    loss_entropy = 0
+    scale_factor = 100.0
+    selected_log_probs = selected_log_probs / scale_factor
+    
+    # if selected_advantages.std() > 1e-8:
+    #     selected_advantages = (selected_advantages) / (selected_advantages.std() + 1e-8)
     
     high_performance_mask = selected_advantages > 1.0
     selected_advantages[high_performance_mask] *= 1.5
@@ -142,17 +151,16 @@ for epoch in range(EPOCHS):
     
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    
-    moving_avg_makespan = 0.9 * moving_avg_makespan + 0.1 * current_avg_makespan
-    # if epoch % 1 == 0:
-    #     print(
-    #         f"Epoch {epoch} | Loss: {loss.item():.2f} | Avg Makespan: {current_avg_makespan:.1f} | Best: {min(batch_makespans):.1f} | Baseline: {moving_avg_makespan:.1f}")
+    scheduler.step()
+
     if epoch % 1 == 0:
+        current_lr = optimizer.param_groups[0]['lr']
         log_msg = (f"Epoch {epoch} | "
                    f"Loss: {loss.item():.2f} | "
-                   f"Avg Makespan: {current_avg_makespan:.1f} | "
+                   f"Avg Makespan: {current_elite_avg:.1f} | "
                    f"Best: {min(batch_makespans):.1f} | "
-                   f"Baseline: {moving_avg_makespan:.1f}")
+                   f"Baseline: {moving_avg_makespan:.1f} | "
+                   f"LR: {current_lr:.6e}")
         print(log_msg)
         
         with open(log_path, "a") as f:

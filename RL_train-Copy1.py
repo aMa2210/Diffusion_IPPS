@@ -31,7 +31,7 @@ T_STEPS = 2
 ENTROPY_START = 0.1
 ENTROPY_END = 0.01
 DECAY_STEPS = 300
-T_SCALER = 0.01
+T_SCALER = 0.001
 
 all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
 
@@ -50,7 +50,7 @@ moving_avg_makespan = 0
 
 log_dir = Path(f"rl_checkpoints/{RUN_NAME}")
 log_dir.mkdir(parents=True, exist_ok=True)
-log_path = log_dir / "training_log.txt"
+log_path = log_dir / "training_log_copy.txt"
 
 with open(log_path, "w") as f:
     f.write(f"Training Log for {RUN_NAME}\n")

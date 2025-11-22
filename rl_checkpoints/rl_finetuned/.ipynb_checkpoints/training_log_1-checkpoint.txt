@@ -1,2 +1,3 @@
 Training Log for rl_finetuned
 ==================================================
+Epoch 0 | Loss: -5.80 | Avg Makespan: 133.8 | Best: 116.0 | Baseline: 133.8
