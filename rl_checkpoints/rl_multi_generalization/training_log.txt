@@ -1,2 +1,4 @@
 Training Log for rl_multi_generalization
 ==================================================
+Epoch 0 | Loss: 0.02 | Train Avg MS: 145.5 | LR: 9.999994e-06 | Val Best Avg: 156.0
+Epoch 1 | Loss: -0.18 | Train Avg MS: 152.1 | LR: 9.999976e-06 | Val Best Avg: 164.0

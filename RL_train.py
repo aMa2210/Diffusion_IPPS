@@ -37,7 +37,7 @@ ENTROPY_START = 0.1
 ENTROPY_END = 0.01
 DECAY_STEPS = 300
 T_SCALER = 0.001
-VALIDATE_STEP = 10  #validate the model every {VALIDATE_STEP} steps
+VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
 def load_dataset(directory):
     """
