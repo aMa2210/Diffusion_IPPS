@@ -3,22 +3,27 @@ import torch.optim as optim
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-
+import glob
+import os
+import random
 from Industrial_Pipeline_Functions import (
     LightweightIndustrialDiffusion,
     load_ipps_problem_from_json,
     get_ipps_problem_data,
     validate_constraints,
 )
-
 from Evaluate import (
     load_problem_definitions,
     simulate_complete_scheduling,
     graph_to_simulation_input
 )
 
-PROBLEM_FILE = "TestSet/1.json"
-RUN_NAME = "rl_finetuned"
+
+random.seed(42)
+TRAIN_DIR = "Problem_TrainSet"
+VAL_DIR = "Problem_ValidationSet"
+# PROBLEM_FILE = "Problem_TrainSet/1.json"
+RUN_NAME = "rl_multi_generalization"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 1e-5   #learning rate
@@ -31,12 +36,47 @@ T_STEPS = 2
 ENTROPY_START = 0.1
 ENTROPY_END = 0.01
 DECAY_STEPS = 300
-T_SCALER = 0.01
+T_SCALER = 0.001
+VALIDATE_STEP = 10  #validate the model every {VALIDATE_STEP} steps
+VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
+def load_dataset(directory):
+    """
+    read all the json files in {directory} and generate PyG Data based on them
+    """
+    dataset = []
+    files = glob.glob(os.path.join(directory, "*.json"))
 
-all_workpieces_objs, machine_power_data = load_problem_definitions(PROBLEM_FILE)
+    if not files:
+        print(f"Warning: No json files found in {directory}")
+        return []
 
-raw_wp_dicts, raw_machines = load_ipps_problem_from_json(PROBLEM_FILE)
-ipps_canvas = get_ipps_problem_data(raw_wp_dicts, raw_machines, DEVICE)
+    print(f"Loading {len(files)} problems from {directory}...")
+
+    for filepath in tqdm(files):
+
+        all_workpieces_objs, machine_power_data = load_problem_definitions(filepath)
+        raw_wp_dicts, raw_machines = load_ipps_problem_from_json(filepath)
+        ipps_canvas = get_ipps_problem_data(raw_wp_dicts, raw_machines, DEVICE)
+
+        # x[:, :2] only the type of the node without considering other properties
+        node_labels_single = ipps_canvas.x[:, :2].argmax(dim=1)
+
+        problem_data = {
+            "id": os.path.basename(filepath),
+            "canvas": ipps_canvas,
+            "wp_objs": all_workpieces_objs,
+            "power_data": machine_power_data,
+            "node_labels": node_labels_single
+        }
+        dataset.append(problem_data)
+
+    return dataset
+
+
+
+train_set = load_dataset(TRAIN_DIR)
+val_set = load_dataset(VAL_DIR)
+
 
 model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=256, num_layers=6, nhead=4, dropout=0.1,device=DEVICE).to(DEVICE)
 
@@ -45,8 +85,11 @@ model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=256, num_layers=6, 
 optimizer = optim.Adam(model.parameters(), lr=LR)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-7)
 
-global_best_makespan = float('inf')
-moving_avg_makespan = 0
+# baseline for each problem
+baseline_registry = {}
+for prob in train_set:
+    baseline_registry[prob['id']] = None
+
 
 log_dir = Path(f"rl_checkpoints/{RUN_NAME}")
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -58,117 +101,143 @@ with open(log_path, "w") as f:
     
 for epoch in range(EPOCHS):
     model.train()
-    optimizer.zero_grad()
-
     progress = min(1.0, epoch / DECAY_STEPS)
     current_entropy_coef = ENTROPY_START - (ENTROPY_START - ENTROPY_END) * progress
+    random.shuffle(train_set)
 
-    batch_loss = 0
-    batch_makespans = []
-    batch_rewards = []
-    batch_log_probs = []
-    batch_entropies = []
-    node_labels = ipps_canvas.x.argmax(dim=1)
+    epoch_loss_sum = 0
+    epoch_makespan_sum = 0
 
+    pbar = tqdm(train_set, desc=f"Epoch {epoch}", leave=False)
+    for prob in pbar:
+        optimizer.zero_grad()
 
-    for b in range(BATCH_SIZE):
+        prob_id = prob['id']
+        single_canvas = prob['canvas']
 
-        generated_edges, log_prob, entropy, priorities = model.reverse_diffusion_with_logprob(ipps_canvas, DEVICE, time_guidance_scale=T_SCALER)
-        edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
-        is_structurally_valid = validate_constraints(
-            edges_matrix,
-            node_labels,
-            DEVICE,
-            exact=True,
-            data=ipps_canvas
-        )
-        if not is_structurally_valid:
-            raise ValueError("Invalid Graph")
-        else:
-            wp_cycles = graph_to_simulation_input(edges_matrix, ipps_canvas, all_workpieces_objs, priorities)
-            _, energy_report, _ = simulate_complete_scheduling(wp_cycles, machine_power_data)
-            makespan = energy_report['total']['makespan']
+        batch_makespans = []
+        batch_log_probs = []
+        batch_entropies = []
 
-            if makespan <= 0: raise ValueError("Invalid Graph")
+        for b in range(BATCH_SIZE):
+            generated_edges, log_prob, entropy, priorities = model.reverse_diffusion_with_logprob(
+                single_canvas, DEVICE, time_guidance_scale=T_SCALER
+            )
 
+            edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
 
-        batch_makespans.append(makespan)
-        batch_log_probs.append(log_prob)
-        batch_entropies.append(entropy)
+            is_valid = validate_constraints(
+                edges_matrix,
+                prob['node_labels'],
+                DEVICE,
+                exact=True,
+                data=single_canvas
+            )
+            if not is_valid:
+                raise ValueError("Invalid Graph")
+            else:
+                wp_cycles = graph_to_simulation_input(edges_matrix, single_canvas, prob['wp_objs'], priorities)
+                _, energy_report, _ = simulate_complete_scheduling(wp_cycles, prob['power_data'])
+                makespan = energy_report['total']['makespan']
 
+                if makespan <= 0: raise ValueError("Invalid Graph")
+            batch_makespans.append(makespan)
+            batch_log_probs.append(log_prob)
+            batch_entropies.append(entropy)
+        batch_makespans_np = np.array(batch_makespans)
+        batch_mean = np.mean(batch_makespans_np)
 
-    # current_avg_makespan = np.mean(batch_makespans)
-    sorted_makespans = np.sort(batch_makespans)
-    current_elite_avg = np.mean(sorted_makespans[:4])
-    batch_mean = np.mean(batch_makespans)
-    
-    if epoch == 0: 
-        moving_avg_makespan = batch_mean
-            
-    
-    
-    adv_local = batch_mean - np.array(batch_makespans)
-    adv_global = moving_avg_makespan - np.array(batch_makespans)
-    raw_advantages = 0.5 * adv_local + 0.5 * adv_global
-    advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
-    
-    # raw_advantages = np.array([batch_mean - ms for ms in batch_makespans])
-    # advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
-    if advantages.std() > 1e-8:
-        advantages = advantages / (advantages.std() + 1e-8)
-    advantages = torch.clamp(advantages, min=-5.0, max=5.0)
-    
-    moving_avg_makespan = 0.9 * moving_avg_makespan + 0.1 * batch_mean
-    # raw_advantages = np.array([moving_avg_makespan - ms for ms in batch_makespans])
-    # advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
+        if baseline_registry[prob_id] is None:
+            baseline_registry[prob_id] = batch_mean
+        moving_avg = baseline_registry[prob_id]
 
-    # k = max(1, BATCH_SIZE // 2) # 例如保留 8 个
-    k = max(1, BATCH_SIZE)
-    topk_indices = torch.topk(advantages, k).indices # 找出 advantage 最大的 k 个索引
+        adv_local = batch_mean - batch_makespans_np
+        adv_global = moving_avg - batch_makespans_np
+        raw_advantages = 0.5 * adv_local + 0.5 * adv_global
 
-    batch_log_probs_tensor = torch.stack(batch_log_probs) # [B]
-    batch_entropies_tensor = torch.stack(batch_entropies) # [B]
+        advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
 
-    selected_log_probs = batch_log_probs_tensor[topk_indices]
-    selected_advantages = advantages[topk_indices]
-    selected_entropies = batch_entropies_tensor[topk_indices]
-    scale_factor = 100.0
-    selected_log_probs = selected_log_probs / scale_factor
-    
-    # if selected_advantages.std() > 1e-8:
-    #     selected_advantages = (selected_advantages) / (selected_advantages.std() + 1e-8)
-    
-    high_performance_mask = selected_advantages > 1.0
-    selected_advantages[high_performance_mask] *= 1.5
-    loss_policy = -(selected_advantages * selected_log_probs).mean()
-    loss_entropy = -selected_entropies.mean()
-    print(f'loss_policy: {loss_policy}')
-    print(f'loss_entropy: {current_entropy_coef * loss_entropy}')
-    # 总 Loss
-    loss = loss_policy + current_entropy_coef * loss_entropy
+        if advantages.std() > 1e-8:
+            advantages = advantages / (advantages.std() + 1e-8)
+        advantages = torch.clamp(advantages, min=-5.0, max=5.0)
 
-    loss.backward()
-    
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
+        baseline_registry[prob_id] = 0.9 * moving_avg + 0.1 * batch_mean
+
+        k = BATCH_SIZE  # tbd change the top k to control the loss backward logic
+        topk_indices = torch.topk(advantages, k).indices
+
+        batch_log_probs_tensor = torch.stack(batch_log_probs)
+        batch_entropies_tensor = torch.stack(batch_entropies)
+
+        selected_log_probs = batch_log_probs_tensor[topk_indices]
+        selected_advantages = advantages[topk_indices]
+        selected_entropies = batch_entropies_tensor[topk_indices]
+
+        selected_log_probs = selected_log_probs / 100.0
+
+        high_perf = selected_advantages > 1.0
+        selected_advantages[high_perf] *= 1.5
+
+        loss_policy = -(selected_advantages * selected_log_probs).mean()
+        loss_entropy = -selected_entropies.mean()
+
+        loss = loss_policy + current_entropy_coef * loss_entropy
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        epoch_loss_sum += loss.item()
+        epoch_makespan_sum += batch_mean
+        pbar.set_postfix({'L': f"{loss.item():.2f}", 'Avg': f"{batch_mean:.1f}"})
+
     scheduler.step()
+    current_lr = optimizer.param_groups[0]['lr']
 
-    if epoch % 1 == 0:
-        current_lr = optimizer.param_groups[0]['lr']
-        log_msg = (f"Epoch {epoch} | "
-                   f"Loss: {loss.item():.2f} | "
-                   f"Avg Makespan: {current_elite_avg:.1f} | "
-                   f"Best: {min(batch_makespans):.1f} | "
-                   f"Baseline: {moving_avg_makespan:.1f} | "
-                   f"LR: {current_lr:.6e}")
-        print(log_msg)
-        
-        with open(log_path, "a") as f:
-            f.write(log_msg + "\n") 
+    avg_train_loss = epoch_loss_sum / len(train_set)
+    avg_train_makespan = epoch_makespan_sum / len(train_set)
 
-    # if epoch % 100 == 0:
-    #     save_dir = Path(f"rl_checkpoints/{RUN_NAME}")
-    #     save_dir.mkdir(parents=True, exist_ok=True)
-    #     torch.save(model.state_dict(), save_dir / f"model_ep{epoch}.pth")
+    val_msg = ""
+    if len(val_set) > 0 and (epoch % VALIDATE_STEP == 0):
+        model.eval()
+        val_makespans = []
+        with torch.no_grad():
+            for v_prob in val_set:
+                TEST_BATCH = VALIDATE_BS
+                best_ms = float('inf')
+                for _ in range(TEST_BATCH):
+                    e_onehot, _, _, prio = model.reverse_diffusion_with_logprob(
+                        v_prob['canvas'], DEVICE, time_guidance_scale=T_SCALER
+                    )
+                    e_mat = e_onehot.argmax(dim=-1).cpu()
 
-print("#######################Finished#######################")
+                    if validate_constraints(e_mat, v_prob['node_labels'], DEVICE, exact=True,
+                                            data=v_prob['canvas']):
+                        wp = graph_to_simulation_input(e_mat, v_prob['canvas'], v_prob['wp_objs'], prio)
+                        _, rep, _ = simulate_complete_scheduling(wp, v_prob['power_data'])
+                        ms = rep['total']['makespan']
+                        if ms < best_ms:
+                            best_ms = ms
+                    else: raise ValueError("Invalid Graph for Validation")
+
+                val_makespans.append(best_ms)
+
+        if len(val_makespans) > 0:
+            avg_val_ms = np.mean(val_makespans)
+            val_msg = f" | Val Best Avg: {avg_val_ms:.1f}"
+        else:
+            val_msg = " | Val Failed"
+
+    log_msg = (f"Epoch {epoch} | "
+               f"Loss: {avg_train_loss:.2f} | "
+               f"Train Avg MS: {avg_train_makespan:.1f} | "
+               f"LR: {current_lr:.6e}"
+               f"{val_msg}")
+
+    print(log_msg)
+    with open(log_path, "a") as f:
+        f.write(log_msg + "\n")
+
+    if epoch % 100 == 0:
+        torch.save(model.state_dict(), log_dir / f"model_ep{epoch}.pth")
+print("Done.")
