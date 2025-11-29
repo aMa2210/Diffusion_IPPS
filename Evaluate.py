@@ -32,25 +32,32 @@ def load_problem_definitions(json_path: str) -> Tuple[List[Workpiece], Dict]:
         )
         workpieces_objs.append(new_wp)
 
+    # machine_power = {
+    #     1: {'no_load': 0.8, 'processing': 2.4},
+    #     2: {'no_load': 1.2, 'processing': 3.6},
+    #     3: {'no_load': 1.4, 'processing': 4.1},
+    #     4: {'no_load': 0.8, 'processing': 3.8},
+    #     5: {'no_load': 1.3, 'processing': 2.1},
+    #     6: {'no_load': 1.5, 'processing': 4.3},
+    #     7: {'no_load': 0.8, 'processing': 2.4},
+    #     8: {'no_load': 1.2, 'processing': 3.6},
+    #     9: {'no_load': 1.4, 'processing': 4.1},
+    #     10: {'no_load': 0.8, 'processing': 3.8},
+    #     11: {'no_load': 1.3, 'processing': 2.1},
+    #     12: {'no_load': 1.5, 'processing': 4.3},
+    #     13: {'no_load': 0.8, 'processing': 2.4},
+    #     14: {'no_load': 1.2, 'processing': 3.6},
+    #     15: {'no_load': 1.4, 'processing': 4.1},
+    #     16: {'no_load': 0.8, 'processing': 3.8},
+    #     17: {'no_load': 1.3, 'processing': 2.1},
+    #     18: {'no_load': 1.5, 'processing': 4.3}
+    # }
     machine_power = {
-        1: {'no_load': 0.8, 'processing': 2.4},
-        2: {'no_load': 1.2, 'processing': 3.6},
-        3: {'no_load': 1.4, 'processing': 4.1},
-        4: {'no_load': 0.8, 'processing': 3.8},
-        5: {'no_load': 1.3, 'processing': 2.1},
-        6: {'no_load': 1.5, 'processing': 4.3},
-        7: {'no_load': 0.8, 'processing': 2.4},
-        8: {'no_load': 1.2, 'processing': 3.6},
-        9: {'no_load': 1.4, 'processing': 4.1},
-        10: {'no_load': 0.8, 'processing': 3.8},
-        11: {'no_load': 1.3, 'processing': 2.1},
-        12: {'no_load': 1.5, 'processing': 4.3},
-        13: {'no_load': 0.8, 'processing': 2.4},
-        14: {'no_load': 1.2, 'processing': 3.6},
-        15: {'no_load': 1.4, 'processing': 4.1},
-        16: {'no_load': 0.8, 'processing': 3.8},
-        17: {'no_load': 1.3, 'processing': 2.1},
-        18: {'no_load': 1.5, 'processing': 4.3}
+        i: {
+            'no_load': 1,
+            'processing': 1
+        }
+        for i in range(1, 101)
     }
 
     print(f"Task loaded from {json_path} with {len(workpieces_objs)} workpieces")
