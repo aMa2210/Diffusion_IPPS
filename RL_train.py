@@ -238,6 +238,6 @@ for epoch in range(EPOCHS):
     with open(log_path, "a") as f:
         f.write(log_msg + "\n")
 
-    if epoch % 100 == 0:
+    if (epoch + 1) % 100 == 0 and epoch != 0:
         torch.save(model.state_dict(), log_dir / f"model_ep{epoch}.pth")
 print("Done.")
