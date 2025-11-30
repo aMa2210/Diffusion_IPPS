@@ -25,15 +25,15 @@ from Evaluate import (
 from Generate_random_problem_instances import generate_random_ipps_problem
 
 # ================= 配置区域 =================
-MODEL_PATH = "rl_checkpoints/rl_multi_generalization_BATCH_SIZE16_T_STEPS4/model_ep1999.pth"  # 请确认路径是否正确
+MODEL_PATH = "rl_checkpoints/rl_multi_generalization_BATCH_SIZE16_T_STEPS4/model_ep1999.pth"
 TEST_SIZES = [10, 30, 50, 100]  # 要测试的工件数量 (Job sizes)
 NUM_INSTANCES = 10  # 每个尺寸生成多少个问题
 NUM_MACHINES = [5, 5, 10, 10]  # 固定机器数量，模拟车间规模
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-T_STEPS = 4  # 推理时可以用较小的步数，或者保持和训练一致
-HIDDEN_DIM = 256  # 假设你已经改为了 64，如果是 12 请改回 12
-
+T_STEPS = 4
+HIDDEN_DIM = 256
+TIME_GUIDANCE_SCALE = 0.001
 
 # ===========================================
 
@@ -76,7 +76,7 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
     # 2. 模型推理
     # 注意：推理时可以调高 time_guidance_scale 来增强引导
     generated_edges, _, _, priorities = model.reverse_diffusion_with_logprob(
-        ipps_canvas, device, time_guidance_scale=0.001
+        ipps_canvas, device, time_guidance_scale=TIME_GUIDANCE_SCALE
     )
 
     edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()

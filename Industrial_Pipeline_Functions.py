@@ -850,7 +850,7 @@ class LightweightIndustrialDiffusion(nn.Module):
     #
     #     return node_logits, edge_logits_list
 
-    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1):
+    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1, return_trajectory=False):
         """
         For RL sampling specifically
         """
@@ -874,6 +874,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         total_log_prob = 0.0
         total_entropy = 0.0
+        trajectory = []
 
         for t in range(self.T - 1, -1, -1):
 
@@ -934,11 +935,21 @@ class LightweightIndustrialDiffusion(nn.Module):
                 total_entropy += step_entropy
 
                 new_e_indices[op_indices, actions] = 1
-
                 new_e_indices[pinned_edge_mask] = 1
+                if return_trajectory:
+                    step_snapshot = (
+                        new_e_indices.detach().cpu().clone(),
+                        selected_priorities.detach().cpu().clone()
+                    )
+                    trajectory.append(step_snapshot)
+
                 e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
 
-        return e, total_log_prob, total_entropy, selected_priorities
+        if return_trajectory:
+            return e, total_log_prob, total_entropy, selected_priorities, trajectory
+        else:
+            return e, total_log_prob, total_entropy, selected_priorities
+
     
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()
