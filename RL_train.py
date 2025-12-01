@@ -18,18 +18,18 @@ from Evaluate import (
     graph_to_simulation_input
 )
 
-
-random.seed(42)
+SEED = 42
+random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_multi_generalization"
+RUN_NAME = "rl_adding_temperature"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 1e-5   #learning rate
-EPOCHS = 2000
-BATCH_SIZE = 32
-T_STEPS = 2
+EPOCHS = 1000
+BATCH_SIZE = 8
+T_STEPS = 4
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
@@ -39,6 +39,10 @@ DECAY_STEPS = 300
 T_SCALER = 0.001
 VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
+HIDDEN_DIMENSION = 128
+NUM_LAYERS = 4
+N_HEADS = 4
+TEMPERATURE_METHOD = 'cosine'
 def load_dataset(directory):
     """
     read all the json files in {directory} and generate PyG Data based on them
@@ -78,7 +82,7 @@ train_set = load_dataset(TRAIN_DIR)
 val_set = load_dataset(VAL_DIR)
 
 
-model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=256, num_layers=6, nhead=4, dropout=0.1,device=DEVICE).to(DEVICE)
+model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=HIDDEN_DIMENSION, num_layers=NUM_LAYERS, nhead=N_HEADS, dropout=0.1,device=DEVICE).to(DEVICE)
 
 # model.load_state_dict(torch.load("ablation_runs_11_19_for_RL/baseline/model.pth"))
 
@@ -94,6 +98,27 @@ for prob in train_set:
 log_dir = Path(f"rl_checkpoints/{RUN_NAME}")
 log_dir.mkdir(parents=True, exist_ok=True)
 log_path = log_dir / "training_log.txt"
+config = {
+    "RUN_NAME": RUN_NAME,
+    "SEED": SEED,
+    "TRAIN_DIR": TRAIN_DIR,
+    "VAL_DIR": VAL_DIR,
+    "LR": LR,
+    "EPOCHS": EPOCHS,
+    "BATCH_SIZE": BATCH_SIZE,
+    "T_STEPS": T_STEPS,
+    "ENTROPY_START": ENTROPY_START,
+    "ENTROPY_END": ENTROPY_END,
+    "DECAY_STEPS": DECAY_STEPS,
+    "T_SCALER": T_SCALER,
+    "VALIDATE_STEP": VALIDATE_STEP,
+    "VALIDATE_BS": VALIDATE_BS,
+    "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
+    "NUM_LAYERS": NUM_LAYERS,
+    "N_HEADS": N_HEADS,
+    "DEVICE": str(DEVICE),
+    "Description": f"RL training with {TEMPERATURE_METHOD} temperature annealing"
+}
 
 with open(log_path, "w") as f:
     f.write(f"Training Log for {RUN_NAME}\n")
@@ -121,7 +146,7 @@ for epoch in range(EPOCHS):
 
         for b in range(BATCH_SIZE):
             generated_edges, log_prob, entropy, priorities = model.reverse_diffusion_with_logprob(
-                single_canvas, DEVICE, time_guidance_scale=T_SCALER
+                single_canvas, DEVICE, time_guidance_scale=T_SCALER, temperature_method=TEMPERATURE_METHOD
             )
 
             edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
