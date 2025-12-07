@@ -152,6 +152,7 @@ from torch_geometric.nn import TransformerConv
 from torch_geometric.utils import to_dense_batch, to_dense_adj
 from torch_geometric.data import Data
 import os
+from torch_geometric.data import Batch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -693,7 +694,14 @@ class LightweightIndustrialDiffusion(nn.Module):
         # Edge Attributes 处理
         if time_matrix is not None:
             src, dst = edge_index
-            edge_times = time_matrix[src, dst].unsqueeze(-1)
+            # edge_times = time_matrix[src, dst].unsqueeze(-1)
+            # edge_attr = self.edge_encoder(edge_times)
+            if time_matrix.size(0) < x.size(0):
+                num_nodes_per_graph = time_matrix.size(0)
+                edge_times = time_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
+            else:
+                edge_times = time_matrix[src, dst].unsqueeze(-1)
+                # === [Batch Patch End] ===
             edge_attr = self.edge_encoder(edge_times)
         else:
             print('no time metrix!!!')
@@ -809,113 +817,133 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         return log_logits
 
-    def reverse_diffusion_with_logprob(self, data, device, time_guidance_scale=0.1, return_trajectory=False, temperature_method = 'cosine',
+    def reverse_diffusion_with_logprob(self, data, device, num_samples=1,
+                                       time_guidance_scale=0.1, return_trajectory=False, temperature_method='cosine',
                                        start_temp=2.0, end_temp=0.1):
         """
-        For RL sampling specifically
+        For RL sampling
         """
-        num_nodes = data.x.size(0)
-        x = data.x.clone()
+        data_list = [data.clone() for _ in range(num_samples)]
+        batch_data = Batch.from_data_list(data_list).to(device)
+        num_nodes_per_graph = data.x.size(0)
+        total_nodes = batch_data.x.size(0)
+        B = num_samples
+        x_single = data.x
+        node_types = x_single.argmax(dim=1)
+        allowed_mask_single = get_ipps_allowed_mask(node_types, data, device)
+        allowed_mask_batch = allowed_mask_single.unsqueeze(0).expand(B, -1, -1)
 
         seq_edges_src = data.edge_index[0]
         seq_edges_tgt = data.edge_index[1]
-        pinned_edge_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
-        pinned_edge_mask[seq_edges_src, seq_edges_tgt] = True
+        pinned_mask_single = torch.zeros((num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
+        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True
+        pinned_mask_batch = pinned_mask_single.unsqueeze(0).expand(B, -1, -1)
 
-        node_types = x.argmax(dim=1)
         op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
         machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
+        e = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph, self.edge_num_classes), device=device)
+        e[:, :, :, 0] = 1  # Default NoEdge
+        e[pinned_mask_batch] = torch.tensor([0.0, 1.0], device=device)
 
-        allowed_mask = get_ipps_allowed_mask(node_types, data, device)
-
-        e = torch.zeros((num_nodes, num_nodes, self.edge_num_classes), device=device)
-        e[:, :, 0] = 1
-        e[pinned_edge_mask] = torch.tensor([0.0, 1.0], device=device)
-
-        total_log_prob = 0.0
-        total_entropy = 0.0
+        total_log_prob = torch.zeros(B, device=device)
+        total_entropy = torch.zeros(B, device=device)
         trajectory = []
+
 
         for t in range(self.T - 1, -1, -1):
 
             current_temp = self.get_temperature(t, self.T, start_temp, end_temp, method=temperature_method)
 
             current_edge_labels = e.argmax(dim=-1)
-            edge_index_t = (current_edge_labels > 0).nonzero(as_tuple=False).t().contiguous()
-
-            # Forward Pass
-            tm = data.time_matrix
-            edge_outputs_list = self.forward(x, edge_index_t, data.batch, t, tm)
-
+            b_idx, u, v = (current_edge_labels > 0).nonzero(as_tuple=True)
+            global_u = u + b_idx * num_nodes_per_graph
+            global_v = v + b_idx * num_nodes_per_graph
+            edge_index_t = torch.stack([global_u, global_v], dim=0)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
+##########################################
             if edge_outputs_list:
-                edge_output = edge_outputs_list[0]
-                # edge_logits = edge_logits_list[0]
-                edge_logits = edge_output[:, :, :2]
-                score_matrix = edge_logits[:, :, 1]  # shape: [N, N]
-
-                prio_mean = edge_output[:, :, 2]
-                prio_log_std = edge_output[:, :, 3]
+                # edge_output = edge_outputs_list[0]  # [B, N, N, 4]
+                edge_output = torch.stack(edge_outputs_list, dim=0)
+                # --- Priorities ---
+                prio_mean = edge_output[:, :, :, 2]
+                prio_log_std = edge_output[:, :, :, 3]
                 prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
                 scaled_prio_std = prio_std * current_temp + 1e-6
 
-                prio_dist = Normal(prio_mean, scaled_prio_std)
+                prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
                 raw_priority_sample = prio_dist.sample()
                 priority_scores = torch.sigmoid(raw_priority_sample)
 
-                # priority_scores = torch.sigmoid(raw_priority)
+                # --- Routing ---
+                edge_logits = edge_output[:, :, :, :2]
+                score_matrix = edge_logits[:, :, :, 1]  # [B, N, N]
 
-                score_matrix = score_matrix - (data.time_matrix * time_guidance_scale)
+                # Time Guidance (广播: [B, N, N] - [1, N, N])
+                score_matrix = score_matrix - (data.time_matrix.unsqueeze(0) * time_guidance_scale)
 
-                new_e_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long, device=device)
-                new_e_indices[pinned_edge_mask] = 1
+                new_e_indices = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph), dtype=torch.long,
+                                            device=device)
+                new_e_indices[pinned_mask_batch] = 1
 
-                op_machine_scores = score_matrix.clone()
-                op_machine_scores = op_machine_scores / current_temp
+                op_machine_scores = score_matrix.clone() / current_temp
 
-                op_machine_scores[~allowed_mask] = -1e9
-
+                # Masking (Batch)
+                op_machine_scores[~allowed_mask_batch] = -1e9
                 valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
-                valid_col_mask[:, machine_indices] = True
+                valid_col_mask[:, :, machine_indices] = True
                 op_machine_scores[~valid_col_mask] = -1e9
 
-                target_scores = op_machine_scores[
-                    op_indices]  # [Num_Ops, Num_Nodes] prevent machine-machine connections
+                # Target Scores [B, Num_Ops, Num_Nodes]
+                target_scores = op_machine_scores[:, op_indices, :]
 
+                # Sample
                 dist = torch.distributions.Categorical(logits=target_scores)
+                actions = dist.sample()  # [B, Num_Ops]
 
-                actions = dist.sample()
-                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample)  # [N, N]
-                relevant_prio_log_prob = selected_prio_log_prob[op_indices]
-                chosen_prio_log_prob = relevant_prio_log_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
+                # --- Metrics ---
+                # Log Prob
+                selected_prio_log_prob = prio_dist.log_prob(raw_priority_sample)
+                relevant_prio_log_prob = selected_prio_log_prob[:, op_indices, :]  # [B, Ops, N]
+                chosen_prio_log_prob = relevant_prio_log_prob.gather(2, actions.unsqueeze(-1)).squeeze(-1)
 
-                step_log_prob = dist.log_prob(actions).sum() + chosen_prio_log_prob.sum()
+                step_log_prob = dist.log_prob(actions).sum(dim=1) + chosen_prio_log_prob.sum(dim=1)
 
-                relevant_priorities = priority_scores[op_indices]
-                selected_priorities = relevant_priorities.gather(1, actions.unsqueeze(1)).squeeze(1)
+                # Entropy
+                entropy_routing = dist.entropy().mean(dim=1)
+                entropy_prio = prio_dist.entropy()[:, op_indices, :].mean(dim=(1, 2))
 
-                # step_log_prob = dist.log_prob(actions).sum()
-                entropy_routing = dist.entropy().mean()
-                entropy_prio = prio_dist.entropy()[op_indices].mean()
-
-                step_entropy = entropy_routing + entropy_prio
                 total_log_prob += step_log_prob
-                total_entropy += step_entropy
+                total_entropy += (entropy_routing + entropy_prio)
 
-                new_e_indices[op_indices, actions] = 1
-                new_e_indices[pinned_edge_mask] = 1
+
+                batch_idx_expanded = torch.arange(B, device=device).unsqueeze(1).expand(-1, len(op_indices))
+                op_indices_expanded = op_indices.unsqueeze(0).expand(B, -1)
+
+                new_e_indices[batch_idx_expanded, op_indices_expanded, actions] = 1
+                new_e_indices[pinned_mask_batch] = 1
+
                 if return_trajectory:
-                    step_snapshot = (
-                        new_e_indices.detach().cpu().clone(),
-                        selected_priorities.detach().cpu().clone()
-                    )
-                    trajectory.append(step_snapshot)
+                    trajectory.append(new_e_indices.detach().cpu().clone())
 
-                e = F.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
+                e = torch.nn.functional.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
 
-        if return_trajectory:
-            return e, total_log_prob, total_entropy, selected_priorities, trajectory
-        else:
-            return e, total_log_prob, total_entropy, selected_priorities
+            relevant_priorities = priority_scores[:, op_indices, :]
+            final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+
+            if num_samples == 1:
+                e = e.squeeze(0)  # [N, N, C]
+                total_log_prob = total_log_prob.squeeze(0)
+                total_entropy = total_entropy.squeeze(0)
+                final_priorities = final_priorities.squeeze(0)
+                if return_trajectory:
+                    trajectory = [t.squeeze(0) for t in trajectory]
+
+            if return_trajectory:
+                return e, total_log_prob, total_entropy, final_priorities, trajectory
+            else:
+                return e, total_log_prob, total_entropy, final_priorities
+
+
 
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()
