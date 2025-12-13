@@ -25,19 +25,19 @@ random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_adding_temperature_BS32_T16_Layer6_HIDDEN_DIMENSION256"
+RUN_NAME = "rl_adding_temperature_BS16_T16_Layer6_HIDDEN_DIMENSION256_extendedTrainset"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-LR = 1e-5   #learning rate
+LR = 2e-4   #learning rate
 EPOCHS = 3000
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 T_STEPS = 16
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
 ENTROPY_START = 0.1
 ENTROPY_END = 0.01
-DECAY_STEPS = 300
+DECAY_STEPS = 1000
 T_SCALER = 0.001
 VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
@@ -93,8 +93,11 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_mi
 
 # baseline for each problem
 baseline_registry = {}
+best_makespan_registry = {}
+
 for prob in train_set:
     baseline_registry[prob['id']] = None
+    best_makespan_registry[prob['id']] = float('inf')
 
 
 log_dir = Path(f"rl_checkpoints/{RUN_NAME}")
@@ -131,6 +134,11 @@ with open(log_path, "w") as f:
     f.write(f"Training Log for {RUN_NAME}\n")
     f.write("==================================================\n")
 
+PROBLEMS_PER_EPOCH = 5
+#################tbd
+train_set = [train_set[0]]  # <--- 只练这一个！
+PROBLEMS_PER_EPOCH = 1
+#################tbd
 for epoch in range(EPOCHS):
     model.train()
 
@@ -139,10 +147,16 @@ for epoch in range(EPOCHS):
 
     random.shuffle(train_set)
 
+    if len(train_set) > PROBLEMS_PER_EPOCH:
+        sampled_problems = random.sample(train_set, PROBLEMS_PER_EPOCH)
+    else:
+        random.shuffle(train_set)
+        sampled_problems = train_set
+    
     epoch_loss_sum = 0
     epoch_makespan_sum = 0
 
-    pbar = tqdm(train_set, desc=f"Epoch {epoch}", leave=False)
+    pbar = tqdm(sampled_problems, desc=f"Epoch {epoch}", leave=False)
     for prob in pbar:
         optimizer.zero_grad()
 
@@ -162,7 +176,8 @@ for epoch in range(EPOCHS):
         )
 
         batch_makespans = []
-
+        batch_flow_times = []
+        
         e_batch_indices = e_batch_onehot.argmax(dim=-1).detach().cpu()  # [B, N, N]
         batch_priorities_cpu = batch_priorities.detach().cpu()  # [B, Num_Ops]
 
@@ -179,19 +194,21 @@ for epoch in range(EPOCHS):
             )
 
             if not is_valid:
-
                 raise ValueError("Invalid Graph Generated")
 
             else:
                 wp_cycles = graph_to_simulation_input(edges_matrix, single_canvas, prob['wp_objs'], priorities)
-                _, energy_report, _ = simulate_complete_scheduling(wp_cycles, prob['power_data'])
+                completion_times, energy_report, _ = simulate_complete_scheduling(wp_cycles, prob['power_data'])
                 makespan = energy_report['total']['makespan']
-
+                
+                ft = sum(completion_times.values())
                 if makespan <= 0: raise ValueError("Invalid Graph")
 
             batch_makespans.append(makespan)
-
+            batch_flow_times.append(ft)
+            
         batch_makespans_np = np.array(batch_makespans)
+        batch_ft_np = np.array(batch_flow_times)
         batch_mean = np.mean(batch_makespans_np)
 
         # Baseline 更新
@@ -199,16 +216,39 @@ for epoch in range(EPOCHS):
             baseline_registry[prob_id] = batch_mean
         moving_avg = baseline_registry[prob_id]
 
+        current_best = best_makespan_registry[prob_id]
+        min_ms_in_batch = batch_makespans_np.min()
+        if min_ms_in_batch < current_best:
+            best_makespan_registry[prob_id] = min_ms_in_batch
+            current_best = min_ms_in_batch
+        
         # 计算 Advantage
         adv_local = batch_mean - batch_makespans_np
+        
         adv_global = moving_avg - batch_makespans_np
-        raw_advantages = 0.5 * adv_local + 0.5 * adv_global
-
+        adv_ms = 0.5 * adv_local + 0.5 * adv_global
+        if adv_ms.std() > 1e-8:
+            adv_ms = adv_ms / (adv_ms.std() + 1e-8)
+            
+        batch_ft_mean = np.mean(batch_ft_np)
+        adv_ft = (batch_ft_mean - batch_ft_np)
+        if adv_ft.std() > 1e-8:
+            adv_ft = adv_ft / (adv_ft.std() + 1e-8)
+            
+        raw_advantages = adv_ms + 0.1 * adv_ft
         advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
+        is_record_breaking = batch_makespans_np <= (current_best + 1e-5)
+        
+        if is_record_breaking.any():
 
-        # Normalize Advantage
+            bonus_mask = torch.tensor(is_record_breaking, device=DEVICE)
+            advantages[bonus_mask] += 1.0 
+
         if advantages.std() > 1e-8:
-            advantages = advantages / (advantages.std() + 1e-8)
+             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            
+        # Normalize Advantage
+        
         advantages = torch.clamp(advantages, min=-5.0, max=5.0)
 
         baseline_registry[prob_id] = 0.9 * moving_avg + 0.1 * batch_mean
@@ -236,10 +276,12 @@ for epoch in range(EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-
+        
         epoch_loss_sum += loss.item()
         epoch_makespan_sum += batch_mean
-        pbar.set_postfix({'L': f"{loss.item():.2f}", 'Avg': f"{batch_mean:.1f}"})
+        gap = (batch_mean - current_best) / (current_best + 1e-5)
+        
+        pbar.set_postfix({'L': f"{loss.item():.2f}", 'Avg': f"{batch_mean:.1f}", 'Gap': f"{gap:.1%}"})
 
     scheduler.step()
     current_lr = optimizer.param_groups[0]['lr']
