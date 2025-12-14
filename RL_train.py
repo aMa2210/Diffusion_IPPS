@@ -25,13 +25,13 @@ random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_adding_temperature_BS16_T16_Layer6_HIDDEN_DIMENSION256_extendedTrainset"
+RUN_NAME = "rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION256_extendedTrainset"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-LR = 2e-4   #learning rate
+LR = 2e-5   #learning rate
 EPOCHS = 3000
-BATCH_SIZE = 16
-T_STEPS = 16
+BATCH_SIZE = 32
+T_STEPS = 4
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500

@@ -11,6 +11,32 @@ from typing import List, Dict, Tuple
 from Industrial_Pipeline_Functions import load_ipps_problem_from_json, get_ipps_problem_data
 import random
 
+# multiprocessing
+def simulation_worker(args):
+    """
+    这是一个包装函数，用于在子进程中运行单个样本的仿真。
+    args 是一个元组，包含所有必要的输入数据。
+    """
+    (edges_matrix, priorities, canvas, wp_objs, power_data) = args
+    
+    try:
+        wp_cycles = graph_to_simulation_input(edges_matrix, canvas, wp_objs, priorities)
+        
+        # 2. 运行仿真
+        completion_times, energy_report, _ = simulate_complete_scheduling(wp_cycles, power_data)
+        
+        # 3. 提取结果
+        makespan = energy_report['total']['makespan']
+        ft = sum(completion_times.values())
+        
+        # 你的代码保证了不会有无效图，但为了多进程安全，还是建议返回由主进程判断
+        return makespan, ft, None # None 代表无错误
+        
+    except Exception as e:
+        # 捕获异常返回，防止子进程崩溃卡死主进程
+        return 1e6, 1e6, str(e)
+
+
 @dataclass
 class Workpiece:
     name: str

@@ -7,7 +7,7 @@ import random
 from tqdm import tqdm
 from pathlib import Path
 import json
-
+import csv
 
 # --- 导入你的模块 ---
 from Industrial_Pipeline_Functions import (
@@ -40,6 +40,22 @@ N_HEADS = 4
 TIME_GUIDANCE_SCALE = 0.001
 TEMPERATURE_METHOD = 'cosine'
 
+
+def save_to_csv(data_list, filename):
+    """
+    将结果列表保存为 CSV 文件
+    data_list: list of tuples (filename, makespan)
+    filename: 输出文件名
+    """
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter=',') # 使用 tab 分隔，或者改成 ',' 使用逗号
+            writer.writerow(['Filename', 'Best_Makespan']) # 表头
+            writer.writerows(data_list)
+        print(f"✅ CSV saved: {filename}")
+    except Exception as e:
+        print(f"❌ Failed to save CSV {filename}: {e}")
+        
 # ===========================================
 
 def run_random_baseline(workpieces_objs, machine_power_data):
@@ -105,7 +121,12 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
 
 
 def main():
-    # --- 1. 加载模型 ---
+
+    csv_data_random = []
+    csv_data_model = []
+
+    results = []
+    
     print(f"🔄 Loading model from {MODEL_PATH}...")
     model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, nhead=N_HEADS, dropout=0.1, device=DEVICE).to(
         DEVICE)
@@ -133,6 +154,8 @@ def main():
 
         for i in tqdm(range(NUM_INSTANCES)):
             # A. 生成随机问题
+            problem_filename = f"gen_{n_jobs}_job_{i}.json"
+            
             problem_file = temp_dir / f"gen_{n_jobs}_job_{i}.json"
             if problem_file.exists():
                 pass
@@ -142,7 +165,7 @@ def main():
                     num_machines=n_machines,
                     num_workpieces=n_jobs,
                     min_ops=4, max_ops=8,  # 随机工序长度
-                    min_opts=2, max_opts=4,  # 柔性程度
+                    min_opts=1, max_opts=3,  # 柔性程度
                     seed=None  # 不设种子以保证随机性
                 )
 
@@ -150,7 +173,7 @@ def main():
             workpieces_objs, machine_power_data = load_problem_definitions(str(problem_file))
 
             # C. 运行 Random Baseline
-            # 运行 3 次取最好，作为强一点的 Baseline
+            # 运行 3 次取平均值
             rand_mk_sum = 0
             for _ in range(3):
                 r_mk, _ = run_random_baseline(workpieces_objs, machine_power_data)
@@ -158,15 +181,25 @@ def main():
 
             avg_rand_mk = rand_mk_sum / 3
             random_makespans.append(avg_rand_mk)
+            csv_data_random.append((problem_filename, int(avg_rand_mk)))
 
-            model_mk_sum = 0
+            model_mks = []  # 1. 创建一个列表来存3次的结果
             with torch.no_grad():
                 for _ in range(3):
                     mk, _ = run_ai_solver(model, str(problem_file), workpieces_objs, machine_power_data, DEVICE)
-                    model_mk_sum += mk
+                    model_mks.append(mk)  # 2. 将每次的结果加入列表
 
-            model_mk = model_mk_sum / 3
+            model_mk = min(model_mks)
+            
+            # model_mk_sum = 0
+            # with torch.no_grad():
+            #     for _ in range(3):
+            #         mk, _ = run_ai_solver(model, str(problem_file), workpieces_objs, machine_power_data, DEVICE)
+            #         model_mk_sum += mk
+
+            # model_mk = model_mk_sum / 3
             model_makespans.append(model_mk)
+            csv_data_model.append((problem_filename, int(model_mk)))
 
         avg_model = np.mean(model_makespans)
         avg_rand = np.mean(random_makespans)
@@ -194,7 +227,11 @@ def main():
 
     # --- 3. 可视化结果 ---
     plot_results(results)
+    print(f"\n💾 Saving CSV files...")
+    save_to_csv(csv_data_random, f"result_random.csv")
+    save_to_csv(csv_data_model, f"result_model_{model_weight_path}.csv")
 
+    plot_results(results)
 
 def plot_results(results):
     sizes = [r["Size"] for r in results]

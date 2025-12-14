@@ -12,6 +12,8 @@ from torch_geometric.utils import softmax as geo_softmax
 from torch_geometric.utils import scatter
 from torch_geometric.nn import global_mean_pool
 import random
+import os
+import glob
 
 def load_data_from_json(filepath):
     with open(filepath, 'r') as f:
@@ -379,18 +381,22 @@ class FJSPEnv:
 # 5. PPO 训练逻辑
 # ==========================================
 def main():
-    # ... (Load Data 和 Init Model 部分保持不变) ...
-    # 建议把 file_path 换回你的路径
-    file_path = 'TestSet/Generalization_Temp/gen_30_job_0.json' 
-    machines, jobs, max_time = load_data_from_json(file_path)
-    norm_factor = float(max_time)
-    
-    graph_template = build_hetero_graph(machines, jobs, norm_factor)
-    env = FJSPEnv(machines, jobs, graph_template, time_scale=norm_factor)
-
+    HIDDEN_DIM = 64
+    ##################
+    train_folder = 'Problem_TrainSet'
+    json_files = glob.glob(os.path.join(train_folder, '*.json'))
+    dataset = []
+    for fpath in json_files:
+        m, j, mt = load_data_from_json(fpath)
+        dataset.append({'machines': m, 'jobs': j, 'max_time': mt, 'name': fpath})
+    temp_graph = build_hetero_graph(dataset[0]['machines'], dataset[0]['jobs'], dataset[0]['max_time'])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HGATModel(graph_template.metadata(), hidden_dim=64).to(device)
+    model = HGATModel(temp_graph.metadata(), hidden_dim=HIDDEN_DIM).to(device)
+    
+    ###################
 
+
+    
     # 学习率建议调小一点，0.0005 对 GAT 稍大，0.0002 比较稳
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
@@ -415,10 +421,15 @@ def main():
     log_makespans = []
 
     for ep in range(MAX_EPISODES):
+        data = random.choice(dataset)
+        machines, jobs, max_time = data['machines'], data['jobs'], float(data['max_time'])
+        current_norm_factor = max_time
+        graph_template = build_hetero_graph(machines, jobs, max_time)
+        env = FJSPEnv(machines, jobs, graph_template, time_scale=max_time)
+    
         graph = env.reset()
         done = False
         ep_reward = 0
-
         while not done:
             time_step += 1
             valid_idx = env.get_valid_actions()
@@ -591,13 +602,23 @@ def main():
 
         # Logging
         final_makespan_norm = max(env.state_m_free_time)
-        real_makespan = final_makespan_norm * norm_factor # 还原真实时间
+        real_makespan = final_makespan_norm * current_norm_factor # 还原真实时间
         log_makespans.append(real_makespan)
 
         if (ep + 1) % 10 == 0:
             avg_makespan = sum(log_makespans[-10:]) / 10.0
             print(f"Episode {ep + 1}: Makespan = {real_makespan:.2f} (Avg: {avg_makespan:.2f})")
 
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(), # 可选：如果想以后接着训练
+        'metadata': temp_graph.metadata(),              # 关键：用于初始化模型结构
+        'hidden_dim': HIDDEN_DIM                                # 关键：模型超参数
+    }
+    
+    save_path = "Comparison_RL_checkpoint/fjsp_ppo_checkpoint.pth"
+    torch.save(checkpoint, save_path)
+    print(f"Model and metadata saved to {save_path}")
     print("Training Finished.")
 
 if __name__ == "__main__":
