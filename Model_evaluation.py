@@ -8,8 +8,8 @@ from tqdm import tqdm
 from pathlib import Path
 import json
 import csv
+from math import ceil
 
-# --- 导入你的模块 ---
 from Industrial_Pipeline_Functions import (
     LightweightIndustrialDiffusion,
     load_ipps_problem_from_json,
@@ -21,10 +21,8 @@ from Evaluate import (
     simulate_complete_scheduling,
     graph_to_simulation_input
 )
-# 假设 generate_random_ipps_problem 在 Generate_Problem.py 中
 from Generate_random_problem_instances import generate_random_ipps_problem
 
-# ================= 配置区域 =================
 model_weight_path = 'rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance'
 MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep2999.pth"
 base_dir = f"rl_checkpoints/{model_weight_path}"
@@ -129,6 +127,96 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
         return float('inf'), float('inf')
 
 
+def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_data, device,
+                            pop_size=30, keep_size=10, num_generations=3,
+                            rollback_t=2):
+    """
+    进化求解器：集成生成、筛选、变异(热力学对齐)、修复过程。
+    """
+    # 1. 准备数据
+    raw_wp_dicts, raw_machines = load_ipps_problem_from_json(problem_file)
+    ipps_canvas = get_ipps_problem_data(raw_wp_dicts, raw_machines, device)
+    node_labels = ipps_canvas.x.argmax(dim=1)
+
+    # 2. 初始种群生成 (Generation 0)
+    # 使用全局配置的 TIME_GUIDANCE_SCALE 和 POS_SCALER
+    edges_batch, _, _, priorities_batch = model.reverse_diffusion_with_logprob(
+        ipps_canvas, device, num_samples=pop_size,
+        time_guidance_scale=TIME_GUIDANCE_SCALE, position_guidance_scale=POS_SCALER,
+        temperature_method=TEMPERATURE_METHOD
+    )
+
+    best_solution = {"makespan": float('inf'), "energy": float('inf')}
+
+    # 3. 进化循环
+    for gen in range(num_generations):
+        # --- A. 评估 (Evaluation) ---
+        population = []
+        e_indices_cpu = edges_batch.argmax(dim=-1).detach().cpu()
+        prio_cpu = priorities_batch.detach().cpu()
+
+        for i in range(pop_size):
+            mk, eng = float('inf'), float('inf')
+            # 验证有效性
+            if validate_constraints(e_indices_cpu[i], node_labels, device, exact=True, data=ipps_canvas):
+                wp_cycles = graph_to_simulation_input(e_indices_cpu[i], ipps_canvas, workpieces_objs, prio_cpu[i])
+                _, rep, _ = simulate_complete_scheduling(wp_cycles, machine_power_data)
+                mk = rep['total']['makespan']
+                eng = rep['total']['total_energy']
+            else:
+                print('error code 9685')
+
+            population.append({
+                "makespan": mk,
+                "energy": eng,
+                "edges_onehot": edges_batch[i],
+                "priorities": priorities_batch[i]
+            })
+
+        # --- B. 筛选 (Selection) ---
+        population.sort(key=lambda x: x["makespan"])
+        elites = population[:keep_size]
+
+        # 记录本代最优
+        current_best = elites[0]
+        if current_best['makespan'] < best_solution['makespan']:
+            best_solution = current_best
+
+        # 如果是最后一轮，直接结束循环
+        if gen == num_generations - 1:
+            break
+
+        # --- C. 变异 (Mutation) ---
+        elite_edges_stack = torch.stack([p["edges_onehot"] for p in elites], dim=0)
+        elite_priorities_stack = torch.stack([p["priorities"] for p in elites], dim=0)
+
+        mutated_input_list = []
+        num_repeats = ceil(pop_size / keep_size)
+
+        for _ in range(num_repeats):
+            mutated_edges, _, rate = model.rl_structural_mutation(
+                elite_edges_stack,
+                elite_priorities_stack,
+                t=rollback_t,
+                temperature_method=TEMPERATURE_METHOD
+            )
+            mutated_input_list.append(mutated_edges)
+
+        next_gen_input = torch.cat(mutated_input_list, dim=0)[:pop_size]
+
+        # --- D. 修复 (Refinement) ---
+        edges_batch, priorities_batch = model.refine_from_intermediate(
+            noisy_e=next_gen_input,
+            data=ipps_canvas,
+            device=device,
+            start_t=rollback_t,
+            time_guidance_scale=TIME_GUIDANCE_SCALE,
+            temperature_method=TEMPERATURE_METHOD
+        )
+
+    # 返回格式与 run_ai_solver 保持一致 (MakeSpan, Energy)
+    return best_solution['makespan'], best_solution['energy']
+
 def main():
     
     need_random = False
@@ -193,13 +281,29 @@ def main():
             random_makespans.append(avg_rand_mk)
             csv_data_random.append((problem_filename, int(avg_rand_mk)))
     
-            model_mks = []  # 1. 创建一个列表来存3次的结果
+            # model_mks = []  # 1. 创建一个列表来存3次的结果
+            # with torch.no_grad():
+            #     for _ in range(3):
+            #         mk, _ = run_ai_solver(model, str(problem_file), workpieces_objs, machine_power_data, DEVICE)
+            #         model_mks.append(mk)  # 2. 将每次的结果加入列表
+            #
+            # model_mk = min(model_mks)
             with torch.no_grad():
-                for _ in range(3):
-                    mk, _ = run_ai_solver(model, str(problem_file), workpieces_objs, machine_power_data, DEVICE)
-                    model_mks.append(mk)  # 2. 将每次的结果加入列表
-
-            model_mk = min(model_mks)
+                current_rollback = max(1, T_STEPS // 2)
+                evo_mk, evo_energy = run_evolutionary_solver(
+                    model,
+                    str(problem_file),
+                    workpieces_objs,
+                    machine_power_data,
+                    DEVICE,
+                    pop_size=30,
+                    keep_size=15,
+                    num_generations=3,
+                    rollback_t=current_rollback
+                )
+            if evo_mk == float('inf'):
+                print(f"   ⚠️ Evo Solver failed for {problem_filename}, using inf.")
+            model_mk = evo_mk
             
             # model_mk_sum = 0
             # with torch.no_grad():
@@ -240,7 +344,7 @@ def main():
     print(f"\n💾 Saving CSV files...")
     if need_random:
         save_to_csv(csv_data_random, f"result_random.csv")
-    save_to_csv(csv_data_model, f"result_model_{model_weight_path}.csv")
+    save_to_csv(csv_data_model, f"result_model_{model_weight_path}_evo.csv")
 
     plot_results(results)
 
