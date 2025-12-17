@@ -818,7 +818,8 @@ class LightweightIndustrialDiffusion(nn.Module):
         return log_logits
 
     def reverse_diffusion_with_logprob(self, data, device, num_samples=1,
-                                       time_guidance_scale=0.1, return_trajectory=False, temperature_method='cosine',
+                                       time_guidance_scale=0.1, position_guidance_scale=0.0,
+                                       return_trajectory=False, temperature_method='cosine',
                                        start_temp=2.0, end_temp=0.1):
         """
         For RL sampling
@@ -850,6 +851,16 @@ class LightweightIndustrialDiffusion(nn.Module):
         trajectory = []
 
 
+        x_dense, _ = to_dense_batch(batch_data.x, batch_data.batch) 
+    
+        # x_dense[:, :, 2] 是 norm_pos (0.0=首工序, 1.0=尾工序, -1.0=机器)
+        # 我们只关心工序节点 (type==0, 即 x_dense[:,:,0]==1)
+        is_op_node = (x_dense[:, :, 0] == 1).float() # operation node
+        norm_pos = x_dense[:, :, 2]  # operation position
+        
+        pos_bias_raw = (1.0 - norm_pos) * is_op_node
+        pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
+        
         for t in range(self.T - 1, -1, -1):
 
             current_temp = self.get_temperature(t, self.T, start_temp, end_temp, method=temperature_method)
@@ -866,6 +877,9 @@ class LightweightIndustrialDiffusion(nn.Module):
                 edge_output = torch.stack(edge_outputs_list, dim=0)
                 # --- Priorities ---
                 prio_mean = edge_output[:, :, :, 2]
+                if position_guidance_scale > 0:
+                    prio_mean = prio_mean + pos_bias_tensor
+                
                 prio_log_std = edge_output[:, :, :, 3]
                 prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
                 scaled_prio_std = prio_std * current_temp + 1e-6

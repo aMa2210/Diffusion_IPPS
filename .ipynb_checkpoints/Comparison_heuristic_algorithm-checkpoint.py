@@ -200,9 +200,9 @@ def load_data_from_json(filepath):
 
 if __name__ == "__main__":
 
-    # folder_path = os.path.join("TestSet", "Generalization_Temp")
-    folder_path = 'Problem_TrainSet'
-    output_csv = "batch_results_trainset.csv"
+    folder_path = os.path.join("TestSet", "Generalization_Temp")
+    # folder_path = 'Problem_TrainSet'
+    output_csv = "results_GA.csv"
 
     # 检查文件夹是否存在
     if not os.path.exists(folder_path):

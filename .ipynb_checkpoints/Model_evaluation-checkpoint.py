@@ -25,19 +25,28 @@ from Evaluate import (
 from Generate_random_problem_instances import generate_random_ipps_problem
 
 # ================= 配置区域 =================
-model_weight_path = 'rl_adding_temperature_BS32_T16_Layer6_HIDDEN_DIMENSION256'
-MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep1999.pth"
+model_weight_path = 'rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance'
+MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep2999.pth"
+base_dir = f"rl_checkpoints/{model_weight_path}"
+config_path = os.path.join(base_dir, "config.json")
+if os.path.exists(config_path):
+    print(f"Loading config file: {config_path}")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+else:
+    raise FileNotFoundError(f"config file does not exist: {config_path}")
 TEST_SIZES = [10, 30, 50, 100]  # 要测试的工件数量 (Job sizes)
 NUM_MACHINES = [5, 5, 10, 10]  # 固定机器数量，模拟车间规模
 OUTPUT_FILE = f"generalization_test_results_{model_weight_path}.json"
 NUM_INSTANCES = 10  # 每个尺寸生成多少个问题
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TIME_GUIDANCE_SCALE = config.get("T_SCALER", 0.001)
 
-T_STEPS = 16
-HIDDEN_DIM = 256
-NUM_LAYERS = 6
-N_HEADS = 4
-TIME_GUIDANCE_SCALE = 0.001
+T_STEPS = config.get("T_STEPS", 4)
+HIDDEN_DIM = config.get("HIDDEN_DIMENSION", 128)
+NUM_LAYERS = config.get("NUM_LAYERS", 6)
+N_HEADS = config.get("N_HEADS", 4)
+POS_SCALER = config.get("Pos_SCALER", 2.0)
 TEMPERATURE_METHOD = 'cosine'
 
 
@@ -49,7 +58,7 @@ def save_to_csv(data_list, filename):
     """
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f, delimiter=',') # 使用 tab 分隔，或者改成 ',' 使用逗号
+            writer = csv.writer(f, delimiter=',')
             writer.writerow(['Filename', 'Best_Makespan']) # 表头
             writer.writerows(data_list)
         print(f"✅ CSV saved: {filename}")
@@ -97,7 +106,7 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
     # 2. 模型推理
     # 注意：推理时可以调高 time_guidance_scale 来增强引导
     generated_edges, _, _, priorities = model.reverse_diffusion_with_logprob(
-        ipps_canvas, device, time_guidance_scale=TIME_GUIDANCE_SCALE, temperature_method=TEMPERATURE_METHOD,
+        ipps_canvas, device, time_guidance_scale=TIME_GUIDANCE_SCALE, position_guidance_scale=POS_SCALER, temperature_method=TEMPERATURE_METHOD,
     )
 
     edges_matrix = generated_edges.argmax(dim=-1).detach().cpu()
@@ -121,7 +130,8 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
 
 
 def main():
-
+    
+    need_random = False
     csv_data_random = []
     csv_data_model = []
 
@@ -182,7 +192,7 @@ def main():
             avg_rand_mk = rand_mk_sum / 3
             random_makespans.append(avg_rand_mk)
             csv_data_random.append((problem_filename, int(avg_rand_mk)))
-
+    
             model_mks = []  # 1. 创建一个列表来存3次的结果
             with torch.no_grad():
                 for _ in range(3):
@@ -228,7 +238,8 @@ def main():
     # --- 3. 可视化结果 ---
     plot_results(results)
     print(f"\n💾 Saving CSV files...")
-    save_to_csv(csv_data_random, f"result_random.csv")
+    if need_random:
+        save_to_csv(csv_data_random, f"result_random.csv")
     save_to_csv(csv_data_model, f"result_model_{model_weight_path}.csv")
 
     plot_results(results)

@@ -57,7 +57,7 @@ def draw_gantt_chart(schedule, filename, makespan):
 
     # 4. 显示或保存
     plt.tight_layout()
-    plt.savefig(f"gantt_{filename}.png") # 如果需要保存，取消注释
+    # plt.savefig(f"gantt_{filename}.png") # 如果需要保存，取消注释
     plt.show()  # 直接弹窗显示
     plt.close() # 关闭画布防止内存溢出
     
@@ -427,7 +427,7 @@ if __name__ == "__main__":
     # --- 用户配置 ---
     MODEL_CHECKPOINT = "Comparison_RL_checkpoint/fjsp_ppo_checkpoint.pth"
     TEST_DATA_DIR = "TestSet/Generalization_Temp"
-    TEST_DATA_DIR = "Problem_TrainSet"
+    # TEST_DATA_DIR = "Problem_TrainSet"
     OUTPUT_FILE = "results_RL.csv"
     
     evaluate_folder(MODEL_CHECKPOINT, TEST_DATA_DIR, OUTPUT_FILE)

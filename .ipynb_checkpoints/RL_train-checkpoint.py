@@ -25,7 +25,7 @@ random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION256_extendedTrainset"
+RUN_NAME = "rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 2e-5   #learning rate
@@ -39,9 +39,10 @@ ENTROPY_START = 0.1
 ENTROPY_END = 0.01
 DECAY_STEPS = 1000
 T_SCALER = 0.001
+POS_SCALER = 2.0
 VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
-HIDDEN_DIMENSION = 256
+HIDDEN_DIMENSION = 128
 NUM_LAYERS = 6
 N_HEADS = 4
 TEMPERATURE_METHOD = 'cosine'
@@ -116,6 +117,7 @@ config = {
     "ENTROPY_END": ENTROPY_END,
     "DECAY_STEPS": DECAY_STEPS,
     "T_SCALER": T_SCALER,
+    "Pos_SCALER": POS_SCALER,
     "VALIDATE_STEP": VALIDATE_STEP,
     "VALIDATE_BS": VALIDATE_BS,
     "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
@@ -136,8 +138,8 @@ with open(log_path, "w") as f:
 
 PROBLEMS_PER_EPOCH = 5
 #################tbd
-train_set = [train_set[0]]  # <--- 只练这一个！
-PROBLEMS_PER_EPOCH = 1
+# train_set = [train_set[0]]  # <--- 只练这一个！
+# PROBLEMS_PER_EPOCH = 1
 #################tbd
 for epoch in range(EPOCHS):
     model.train()
@@ -170,8 +172,9 @@ for epoch in range(EPOCHS):
          ) = model.reverse_diffusion_with_logprob(
             single_canvas,
             DEVICE,
-            num_samples=BATCH_SIZE,  # <--- 并行生成
+            num_samples=BATCH_SIZE,
             time_guidance_scale=T_SCALER,
+            position_guidance_scale=POS_SCALER,
             temperature_method=TEMPERATURE_METHOD,
         )
 
@@ -300,6 +303,7 @@ for epoch in range(EPOCHS):
                     DEVICE,
                     num_samples=VALIDATE_BS,
                     time_guidance_scale=T_SCALER,
+                    position_guidance_scale=POS_SCALER,
                     temperature_method=TEMPERATURE_METHOD,
                 )
 
