@@ -20,8 +20,6 @@ def simulation_worker(args):
     (edges_matrix, priorities, canvas, wp_objs, power_data) = args
     
     try:
-        # 1. 转换图结构为仿真输入
-        # 注意：这里的输入必须已经是 CPU 上的数据 (numpy 或 list)，不能是 GPU tensor
         wp_cycles = graph_to_simulation_input(edges_matrix, canvas, wp_objs, priorities)
         
         # 2. 运行仿真

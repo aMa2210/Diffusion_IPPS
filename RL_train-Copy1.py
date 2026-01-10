@@ -20,28 +20,29 @@ from Evaluate import (
     graph_to_simulation_input
 )
 
-SEED = 42
+SEED = 65
 random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION256_extendedTrainset_halfK"
+RUN_NAME = "rl_new1219_2"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 2e-5   #learning rate
-EPOCHS = 3000
+EPOCHS = 1000
 BATCH_SIZE = 32
-T_STEPS = 4
+T_STEPS = 8
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
 ENTROPY_START = 0.1
-ENTROPY_END = 0.01
-DECAY_STEPS = 1000
+ENTROPY_END = 0.001
+DECAY_STEPS = 500
 T_SCALER = 0.001
+POS_SCALER = 2.0
 VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
-HIDDEN_DIMENSION = 256
+HIDDEN_DIMENSION = 128
 NUM_LAYERS = 6
 N_HEADS = 4
 TEMPERATURE_METHOD = 'cosine'
@@ -116,6 +117,7 @@ config = {
     "ENTROPY_END": ENTROPY_END,
     "DECAY_STEPS": DECAY_STEPS,
     "T_SCALER": T_SCALER,
+    "Pos_SCALER": POS_SCALER,
     "VALIDATE_STEP": VALIDATE_STEP,
     "VALIDATE_BS": VALIDATE_BS,
     "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
@@ -136,8 +138,8 @@ with open(log_path, "w") as f:
 
 PROBLEMS_PER_EPOCH = 5
 #################tbd
-train_set = [train_set[0]]  # <--- 只练这一个！
-PROBLEMS_PER_EPOCH = 1
+# train_set = [train_set[0]]  # <--- 只练这一个！
+# PROBLEMS_PER_EPOCH = 1
 #################tbd
 for epoch in range(EPOCHS):
     model.train()
@@ -170,8 +172,9 @@ for epoch in range(EPOCHS):
          ) = model.reverse_diffusion_with_logprob(
             single_canvas,
             DEVICE,
-            num_samples=BATCH_SIZE,  # <--- 并行生成
+            num_samples=BATCH_SIZE,
             time_guidance_scale=T_SCALER,
+            position_guidance_scale=POS_SCALER,
             temperature_method=TEMPERATURE_METHOD,
         )
 
@@ -235,7 +238,7 @@ for epoch in range(EPOCHS):
         if adv_ft.std() > 1e-8:
             adv_ft = adv_ft / (adv_ft.std() + 1e-8)
             
-        raw_advantages = adv_ms + 0.05 * adv_ft
+        raw_advantages = adv_ms + 0.1 * adv_ft
         advantages = torch.tensor(raw_advantages, dtype=torch.float32).to(DEVICE)
         is_record_breaking = batch_makespans_np <= (current_best + 1e-5)
         
@@ -253,7 +256,7 @@ for epoch in range(EPOCHS):
 
         baseline_registry[prob_id] = 0.9 * moving_avg + 0.1 * batch_mean
 
-        k = int(BATCH_SIZE * 0.5)
+        k = BATCH_SIZE
         topk_indices = torch.topk(advantages, k).indices
 
         selected_log_probs = batch_log_probs[topk_indices]
@@ -270,6 +273,12 @@ for epoch in range(EPOCHS):
         loss_policy = -(selected_advantages * selected_log_probs).mean()
         loss_entropy = -selected_entropies.mean()
 
+        if epoch % 50 == 0:
+            loss_policy_magnitude = (selected_advantages * selected_log_probs).abs().mean()
+            print(f'   >>> [Debug] Net Policy Loss: {loss_policy.item():.4f} | '
+                  f'Abs Magnitude: {loss_policy_magnitude.item():.4f} | ' # <--- 关注这个！
+                  f'Weighted Entropy: {(current_entropy_coef * loss_entropy).item():.4f}')
+        
         loss = loss_policy + current_entropy_coef * loss_entropy
 
         # Backward
@@ -300,6 +309,7 @@ for epoch in range(EPOCHS):
                     DEVICE,
                     num_samples=VALIDATE_BS,
                     time_guidance_scale=T_SCALER,
+                    position_guidance_scale=POS_SCALER,
                     temperature_method=TEMPERATURE_METHOD,
                 )
 

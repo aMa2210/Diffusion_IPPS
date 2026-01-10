@@ -637,7 +637,7 @@ class ResGNNBlock(nn.Module):
 class LightweightIndustrialDiffusion(nn.Module):
     def __init__(self, T=100, input_dim=5, hidden_dim=128, num_layers=6,
                  beta_start=0.0001, beta_end=0.02, nhead=4, dropout=0.1,
-                 device='cuda', edge_dim=1):
+                 device='cuda', edge_dim=16):
         super().__init__()
         self.device = torch.device(device)
         self.T = T
@@ -649,7 +649,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.edge_encoder = nn.Linear(1, edge_dim)  # 如果 edge_attr 只是时间
+        self.edge_encoder = nn.Linear(2, edge_dim)  # edge_attr 是时间和priority
 
         # Time Embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
@@ -680,9 +680,8 @@ class LightweightIndustrialDiffusion(nn.Module):
             nn.Linear(hidden_dim, self.edge_out_dim)
         )
 
-    def forward(self, x, edge_index, batch, t, time_matrix=None):
-        # 1. Embedding Inputs
-        # x shape: [Num_Nodes, Feature_Dim] (One-hot or similar)
+    def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None):
+
         h = self.node_encoder(x.float())
 
         # Time Embedding
@@ -690,24 +689,38 @@ class LightweightIndustrialDiffusion(nn.Module):
         t_emb = self.time_embedder(t_tensor)  # [1, Hidden]
         # 将 t_emb 扩展到每个节点: [Num_Nodes, Hidden]
         t_emb_node = t_emb.repeat(h.size(0), 1)
-
+        src, dst = edge_index
+        
         # Edge Attributes 处理
         if time_matrix is not None:
-            src, dst = edge_index
-            # edge_times = time_matrix[src, dst].unsqueeze(-1)
-            # edge_attr = self.edge_encoder(edge_times)
             if time_matrix.size(0) < x.size(0):
                 num_nodes_per_graph = time_matrix.size(0)
                 edge_times = time_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
             else:
                 edge_times = time_matrix[src, dst].unsqueeze(-1)
                 # === [Batch Patch End] ===
-            edge_attr = self.edge_encoder(edge_times)
         else:
             print('no time metrix!!!')
-            edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
-            edge_attr = self.edge_encoder(edge_attr)
-
+            edge_times = torch.zeros((edge_index.size(1), 1), device=x.device)
+            
+        if priorities is not None:
+            # 假设 priorities 是 [Batch, Num_Nodes] 或者 [Num_Nodes]
+            # 我们需要获取每条边源节点(src)对应的优先级
+            # 如果 priorities 是 [Num_Nodes]，直接索引
+            if priorities.dim() == 1:
+                edge_prios = priorities[src].unsqueeze(-1) 
+            elif priorities.dim() == 2 and priorities.size(0) == x.size(0):
+                 # 如果 priorities 是 [N, 1]
+                 edge_prios = priorities[src]
+            else:
+                 print('error code3745')
+                 edge_prios = torch.zeros_like(edge_times)
+        else:
+            # 默认优先级为 0.5 (中性) 或 0
+            edge_prios = torch.zeros_like(edge_times)
+            
+        raw_edge_attr = torch.cat([edge_times, edge_prios], dim=1)
+        edge_attr = self.edge_encoder(raw_edge_attr)
         # 2. Backbone Processing
         for layer in self.layers:
             # 传入 t_emb_node 用于 AdaLN
@@ -860,7 +873,9 @@ class LightweightIndustrialDiffusion(nn.Module):
         
         pos_bias_raw = (1.0 - norm_pos) * is_op_node
         pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
-        
+        current_priorities = torch.randn(total_nodes, device=device) * 0.5 + 0.5
+        current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
+                                           
         for t in range(self.T - 1, -1, -1):
 
             current_temp = self.get_temperature(t, self.T, start_temp, end_temp, method=temperature_method)
@@ -870,7 +885,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             global_u = u + b_idx * num_nodes_per_graph
             global_v = v + b_idx * num_nodes_per_graph
             edge_index_t = torch.stack([global_u, global_v], dim=0)
-            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix, priorities=current_priorities)
 ##########################################
             if edge_outputs_list:
                 # edge_output = edge_outputs_list[0]  # [B, N, N, 4]
@@ -943,21 +958,25 @@ class LightweightIndustrialDiffusion(nn.Module):
 
             relevant_priorities = priority_scores[:, op_indices, :]
             final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
-
-            if num_samples == 1:
-                e = e.squeeze(0)  # [N, N, C]
-                total_log_prob = total_log_prob.squeeze(0)
-                total_entropy = total_entropy.squeeze(0)
-                final_priorities = final_priorities.squeeze(0)
-                if return_trajectory:
-                    trajectory = [t.squeeze(0) for t in trajectory]
-
+            temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
+            temp_prio_matrix[:, op_indices] = final_priorities
+            current_priorities = temp_prio_matrix.view(-1)
+            
+        if num_samples == 1:
+            e = e.squeeze(0)  # [N, N, C]
+            total_log_prob = total_log_prob.squeeze(0)
+            total_entropy = total_entropy.squeeze(0)
+            final_priorities = final_priorities.squeeze(0)
             if return_trajectory:
-                return e, total_log_prob, total_entropy, final_priorities, trajectory
-            else:
-                return e, total_log_prob, total_entropy, final_priorities
+                trajectory = [t.squeeze(0) for t in trajectory]
+
+        if return_trajectory:
+            return e, total_log_prob, total_entropy, final_priorities, trajectory
+        else:
+            return e, total_log_prob, total_entropy, final_priorities
 
     def refine_from_intermediate(self, noisy_e, data, device, start_t,
+                                 hint_priorities=None,
                                  time_guidance_scale=0.1, position_guidance_scale=0.0,
                                  temperature_method='cosine', start_temp=2.0, end_temp=0.1):
         """
@@ -969,7 +988,7 @@ class LightweightIndustrialDiffusion(nn.Module):
         data_list = [data.clone() for _ in range(B)]
         batch_data = Batch.from_data_list(data_list).to(device)
         num_nodes_per_graph = data.x.size(0)
-
+        total_nodes = batch_data.x.size(0)
         # 2. 继承变异后的边状态 (而不是像原函数那样初始化为全0)
         e = noisy_e.clone()
 
@@ -995,7 +1014,18 @@ class LightweightIndustrialDiffusion(nn.Module):
         pos_bias_raw = (1.0 - norm_pos) * is_op_node
         pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
 
-        # 用于记录最后一步的优先级
+        if hint_priorities is not None:
+            # hint_priorities 是 [B, Num_Ops]
+            # 我们需要把它扩展到 [B, N] 并展平
+            temp_prio = torch.zeros((B, num_nodes_per_graph), device=device)
+            temp_prio[:, op_indices] = hint_priorities
+            current_priorities = temp_prio.view(-1) # [B*N]
+        else:
+            # 如果没有 Hint，就随机初始化
+            current_priorities = torch.randn(total_nodes, device=device) * 0.5 + 0.5
+        
+        current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
+                                     
         final_priorities = None
 
         # 4. 循环：从 start_t 开始倒数，而不是从 self.T 开始
@@ -1010,8 +1040,9 @@ class LightweightIndustrialDiffusion(nn.Module):
             global_u = u + b_idx * num_nodes_per_graph
             global_v = v + b_idx * num_nodes_per_graph
             edge_index_t = torch.stack([global_u, global_v], dim=0)
-            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
-
+            # edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, 
+                                             t, data.time_matrix, priorities=current_priorities)
             if edge_outputs_list:
                 edge_output = torch.stack(edge_outputs_list, dim=0)
 
@@ -1054,6 +1085,10 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 relevant_priorities = priority_scores[:, op_indices, :]
                 final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+                
+                temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
+                temp_prio_matrix[:, op_indices] = final_priorities
+                current_priorities = temp_prio_matrix.view(-1)
 
         return e, final_priorities
 

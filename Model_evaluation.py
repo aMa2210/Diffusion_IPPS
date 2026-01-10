@@ -9,7 +9,7 @@ from pathlib import Path
 import json
 import csv
 from math import ceil
-
+import re
 from Industrial_Pipeline_Functions import (
     LightweightIndustrialDiffusion,
     load_ipps_problem_from_json,
@@ -23,8 +23,8 @@ from Evaluate import (
 )
 from Generate_random_problem_instances import generate_random_ipps_problem
 
-model_weight_path = 'rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance'
-MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep2999.pth"
+model_weight_path = 'rl_new1219_2'
+MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep999.pth"
 base_dir = f"rl_checkpoints/{model_weight_path}"
 config_path = os.path.join(base_dir, "config.json")
 if os.path.exists(config_path):
@@ -40,7 +40,8 @@ NUM_INSTANCES = 10  # 每个尺寸生成多少个问题
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TIME_GUIDANCE_SCALE = config.get("T_SCALER", 0.001)
 
-T_STEPS = config.get("T_STEPS", 4)
+T_STEPS = config.get("T_STEPS", 8)
+print(f'T_STEPS{T_STEPS}')
 HIDDEN_DIM = config.get("HIDDEN_DIMENSION", 128)
 NUM_LAYERS = config.get("NUM_LAYERS", 6)
 N_HEADS = config.get("N_HEADS", 4)
@@ -126,7 +127,43 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
         print(f"Sim Error: {e}")
         return float('inf'), float('inf')
 
+def crossover_batch(elites, num_offspring, data, device):
+    """
+    【回滚版】节点级(Node-wise)交叉：
+    对图中的每一个节点（工序），独立随机决定继承父代A还是父代B的连接策略。
+    这虽然破坏了工件连贯性，但能打散全局资源分配，配合 Diffusion Refine 可能效果更好。
+    """
+    elite_edges = torch.stack([p["edges_onehot"] for p in elites], dim=0) 
+    elite_prios = torch.stack([p["priorities"] for p in elites], dim=0)
+    
+    K = len(elites)
+    # num_nodes = elite_edges.size(1) # 这行没用到，可以注释掉
 
+    # 1. 随机选择父代索引
+    parent1_idx = torch.randint(0, K, (num_offspring,), device=device)
+    parent2_idx = torch.randint(0, K, (num_offspring,), device=device)
+
+    # === A. 优先级交叉 (Blend Crossover) - 保持不变 ===
+    # 优先级的混合总是好的，因为它提供了连续空间的搜索
+    alpha = torch.rand((num_offspring, 1), device=device)
+    child_prios = alpha * elite_prios[parent1_idx] + (1 - alpha) * elite_prios[parent2_idx]
+
+    # === B. 节点级图结构交叉 (Node-wise Random Exchange) ===
+    
+    e1 = elite_edges[parent1_idx] # [B, N, N, C]
+    e2 = elite_edges[parent2_idx]
+    
+    # 生成 Mask: [B, N, 1, 1]
+    # 对每一个节点(行)，抛硬币决定选 P1 还是 P2
+    # 0.5 的概率
+    mask = (torch.rand((num_offspring, e1.size(1), 1, 1), device=device) > 0.5).float()
+    
+    # 混合
+    child_edges = mask * e1 + (1 - mask) * e2
+    
+    return child_edges, child_prios
+
+    
 def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_data, device,
                             pop_size=30, keep_size=10, num_generations=3,
                             rollback_t=2):
@@ -160,7 +197,7 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
             # 验证有效性
             if validate_constraints(e_indices_cpu[i], node_labels, device, exact=True, data=ipps_canvas):
                 wp_cycles = graph_to_simulation_input(e_indices_cpu[i], ipps_canvas, workpieces_objs, prio_cpu[i])
-                _, rep, _ = simulate_complete_scheduling(wp_cycles, machine_power_data)
+                _, rep, completed_ops = simulate_complete_scheduling(wp_cycles, machine_power_data)
                 mk = rep['total']['makespan']
                 eng = rep['total']['total_energy']
             else:
@@ -170,7 +207,8 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
                 "makespan": mk,
                 "energy": eng,
                 "edges_onehot": edges_batch[i],
-                "priorities": priorities_batch[i]
+                "priorities": priorities_batch[i],
+                "schedule": completed_ops
             })
 
         # --- B. 筛选 (Selection) ---
@@ -182,6 +220,7 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
         if current_best['makespan'] < best_solution['makespan']:
             best_solution = current_best
 
+        print(best_solution['makespan'])
         # 如果是最后一轮，直接结束循环
         if gen == num_generations - 1:
             break
@@ -190,32 +229,142 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
         elite_edges_stack = torch.stack([p["edges_onehot"] for p in elites], dim=0)
         elite_priorities_stack = torch.stack([p["priorities"] for p in elites], dim=0)
 
-        mutated_input_list = []
-        num_repeats = ceil(pop_size / keep_size)
+        # mutated_input_list = []
+        num_offspring = pop_size - keep_size
+        # offspring_edges, offspring_prios = crossover_batch(elites, num_new_offspring, device)
+        offspring_edges, offspring_prios = crossover_batch(elites, num_offspring, ipps_canvas, device)
+        # num_repeats = ceil(num_new_offspring / keep_size)
 
-        for _ in range(num_repeats):
-            mutated_edges, _, rate = model.rl_structural_mutation(
-                elite_edges_stack,
-                elite_priorities_stack,
-                t=rollback_t,
-                temperature_method=TEMPERATURE_METHOD
-            )
-            mutated_input_list.append(mutated_edges)
+        # for _ in range(num_repeats):
+        #     mutated_edges, _, rate = model.rl_structural_mutation(
+        #         elite_edges_stack,
+        #         elite_priorities_stack,
+        #         t=rollback_t,
+        #         temperature_method=TEMPERATURE_METHOD
+        #     )
+        #     mutated_input_list.append(mutated_edges)
 
-        next_gen_input = torch.cat(mutated_input_list, dim=0)[:pop_size]
+        # num_repeats = ceil(num_new_offspring / keep_size)
+        # large_edge_batch = elite_edges_stack.repeat(num_repeats, 1, 1, 1)
+        # large_prio_batch = elite_priorities_stack.repeat(num_repeats, 1)
+        # input_edges = large_edge_batch[:num_new_offspring]
+        # input_prios = large_prio_batch[:num_new_offspring]
+        
+        # input_edges = torch.cat([elite_edges_stack, offspring_edges], dim=0)
+        # input_prios = torch.cat([elite_priorities_stack, offspring_prios], dim=0)
+        
+        next_gen_input, mutated_prios, rate = model.rl_structural_mutation(
+            offspring_edges,
+            offspring_prios,
+            t=rollback_t,
+            temperature_method=TEMPERATURE_METHOD
+        )
+        
+        # next_gen_input = torch.cat(mutated_input_list, dim=0)[:num_new_offspring]
 
         # --- D. 修复 (Refinement) ---
-        edges_batch, priorities_batch = model.refine_from_intermediate(
+        refined_edges, refined_priorities = model.refine_from_intermediate(
             noisy_e=next_gen_input,
             data=ipps_canvas,
             device=device,
             start_t=rollback_t,
+            hint_priorities=mutated_prios,
             time_guidance_scale=TIME_GUIDANCE_SCALE,
             temperature_method=TEMPERATURE_METHOD
         )
-
+        elite_edges_stack = torch.stack([p["edges_onehot"] for p in elites], dim=0)
+        elite_priorities_stack = torch.stack([p["priorities"] for p in elites], dim=0)
+        edges_batch = torch.cat([elite_edges_stack, refined_edges], dim=0)
+        priorities_batch = torch.cat([elite_priorities_stack, refined_priorities], dim=0)
     # 返回格式与 run_ai_solver 保持一致 (MakeSpan, Energy)
-    return best_solution['makespan'], best_solution['energy']
+    return best_solution['makespan'], best_solution['energy'], best_solution['schedule']
+
+
+def create_gantt_chart(completed_operations, title="Gantt Chart", filename=None):
+    """
+    修正版甘特图：
+    1. 修复机器 ID 偏移 (显示 M-1 到 M-5)
+    2. 标签对齐 JSON (显示 J1 对应 Workpiece1)
+    """
+    if not completed_operations:
+        print("⚠️ No operations to plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # ==========================================
+    # 1. 数据解析与排序
+    # ==========================================
+    
+    # 获取所有唯一的工件名称
+    raw_workpieces = list(set(op['workpiece'] for op in completed_operations))
+    
+    # 智能排序：从字符串中提取数字进行排序 (Workpiece1, Workpiece2, ..., Workpiece10)
+    # 如果只是字符串排序，Workpiece10 会排在 Workpiece2 前面
+    def extract_number(text):
+        match = re.search(r'\d+', str(text))
+        return int(match.group()) if match else 0
+
+    workpieces = sorted(raw_workpieces, key=extract_number)
+    
+    # 建立映射：Workpiece Name -> Color
+    # 使用 tab20 颜色板，颜色更丰富
+    colors = plt.cm.tab20(np.linspace(0, 1, len(workpieces)))
+    color_map = {wp: colors[i] for i, wp in enumerate(workpieces)}
+
+    # ==========================================
+    # 2. 绘制条形图
+    # ==========================================
+    for operation in completed_operations:
+        m_id = operation['machine']      # 假设这里是 1, 2, 3, 4, 5
+        wp = operation['workpiece']      # e.g., "Workpiece1"
+        start = operation['start_time']
+        dur = operation['processing_time']
+        
+        # 提取工件编号用于显示 (Workpiece1 -> 1)
+        wp_num = extract_number(wp)
+        label_text = f"J{wp_num-1}" # 显示为 J1, J2...
+        
+        # 绘制矩形
+        # 注意：直接在 y=m_id 的位置画图
+        ax.barh(y=m_id, width=dur, left=start, 
+                height=0.6, align='center', 
+                color=color_map[wp], edgecolor='black', alpha=0.9)
+        
+        # 添加文字标签 (白色，加粗)
+        ax.text(start + dur / 2, m_id, label_text, 
+                ha='center', va='center', color='white', fontweight='bold', fontsize=8)
+
+    # ==========================================
+    # 3. 设置坐标轴
+    # ==========================================
+    
+    # 获取所有出现过的机器ID并排序
+    machines = sorted(list(set(op['machine'] for op in completed_operations)))
+    
+    # 设置 Y 轴刻度位置
+    ax.set_yticks(machines)
+    
+    # 【核心修改】：直接使用机器ID显示，不加1
+    # 如果你的数据里机器是 1-5，这里就显示 M-1...M-5
+    ax.set_yticklabels([f"M-{m}" for m in machines])
+    
+    ax.set_ylabel("Machines")
+    ax.set_xlabel("Time")
+    ax.set_title(title)
+    
+    # 添加网格线方便查看时间对齐
+    ax.grid(True, axis='x', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    
+    if filename:
+        plt.savefig(filename, dpi=150)
+        print(f"📊 Gantt chart saved to {filename}")
+        plt.close(fig)
+    else:
+        plt.show()
+        
 
 def main():
     
@@ -224,6 +373,8 @@ def main():
     csv_data_model = []
 
     results = []
+    gantt_dir = Path("Gantt_Charts_Diffusion")
+    gantt_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"🔄 Loading model from {MODEL_PATH}...")
     model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, nhead=N_HEADS, dropout=0.1, device=DEVICE).to(
@@ -270,39 +421,46 @@ def main():
             # B. 加载问题定义
             workpieces_objs, machine_power_data = load_problem_definitions(str(problem_file))
 
+            #############不跑random以节省时间
+            avg_rand_mk = 1000.0  # <--- 强制设置为 1000
+            random_makespans.append(avg_rand_mk)
+            # 即使不跑，也存入CSV数据列表以防索引报错，或者你可以选择不存
+            csv_data_random.append((problem_filename, int(avg_rand_mk)))
             # C. 运行 Random Baseline
             # 运行 3 次取平均值
-            rand_mk_sum = 0
-            for _ in range(3):
-                r_mk, _ = run_random_baseline(workpieces_objs, machine_power_data)
-                rand_mk_sum += r_mk
+            # rand_mk_sum = 0
+            # for _ in range(3):
+            #     r_mk, _ = run_random_baseline(workpieces_objs, machine_power_data)
+            #     rand_mk_sum += r_mk
 
-            avg_rand_mk = rand_mk_sum / 3
-            random_makespans.append(avg_rand_mk)
-            csv_data_random.append((problem_filename, int(avg_rand_mk)))
+            # avg_rand_mk = rand_mk_sum / 3
+            # random_makespans.append(avg_rand_mk)
+            # csv_data_random.append((problem_filename, int(avg_rand_mk)))
     
-            # model_mks = []  # 1. 创建一个列表来存3次的结果
-            # with torch.no_grad():
-            #     for _ in range(3):
-            #         mk, _ = run_ai_solver(model, str(problem_file), workpieces_objs, machine_power_data, DEVICE)
-            #         model_mks.append(mk)  # 2. 将每次的结果加入列表
-            #
-            # model_mk = min(model_mks)
             with torch.no_grad():
-                current_rollback = max(1, T_STEPS // 2)
-                evo_mk, evo_energy = run_evolutionary_solver(
+                # current_rollback = max(1, T_STEPS // 2)
+                current_rollback = max(4, 1)
+                evo_mk, evo_energy, best_schedule = run_evolutionary_solver(
                     model,
                     str(problem_file),
                     workpieces_objs,
                     machine_power_data,
                     DEVICE,
-                    pop_size=30,
-                    keep_size=15,
-                    num_generations=3,
+                    pop_size=40,
+                    keep_size=5,
+                    num_generations=1,
                     rollback_t=current_rollback
                 )
             if evo_mk == float('inf'):
                 print(f"   ⚠️ Evo Solver failed for {problem_filename}, using inf.")
+            else:
+                if best_schedule is not None:
+                    gantt_filename = gantt_dir / f"Gantt_{n_jobs}Jobs_{n_machines}M_Instance{i}_MK{int(evo_mk)}.png"
+                    create_gantt_chart(
+                        best_schedule, 
+                        title=f"Schedule: {n_jobs} Jobs, Makespan: {evo_mk:.1f}", 
+                        filename=str(gantt_filename)
+                    )
             model_mk = evo_mk
             
             # model_mk_sum = 0
@@ -344,7 +502,7 @@ def main():
     print(f"\n💾 Saving CSV files...")
     if need_random:
         save_to_csv(csv_data_random, f"result_random.csv")
-    save_to_csv(csv_data_model, f"result_model_{model_weight_path}_evo.csv")
+    save_to_csv(csv_data_model, f"result_model_{model_weight_path}_evo100_Pguidance5_passPriority_cross.csv")
 
     plot_results(results)
 
@@ -378,7 +536,7 @@ def plot_results(results):
                     ha='center', va='bottom', fontweight='bold', color='green')
 
     plt.tight_layout()
-    plt.savefig(f"Generalization_Test_Result_{model_weight_path}.png", dpi=300)
+    plt.savefig(f"Generalization_Test_Result_{model_weight_path}_passPriority.png", dpi=300)
     print("\n✅ Test finished! Result saved to 'Generalization_Test_Result.png'")
     plt.show()
 

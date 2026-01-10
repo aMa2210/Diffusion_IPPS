@@ -637,7 +637,7 @@ class ResGNNBlock(nn.Module):
 class LightweightIndustrialDiffusion(nn.Module):
     def __init__(self, T=100, input_dim=5, hidden_dim=128, num_layers=6,
                  beta_start=0.0001, beta_end=0.02, nhead=4, dropout=0.1,
-                 device='cuda', edge_dim=1):
+                 device='cuda', edge_dim=16):
         super().__init__()
         self.device = torch.device(device)
         self.T = T
@@ -649,7 +649,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.edge_encoder = nn.Linear(1, edge_dim)  # 如果 edge_attr 只是时间
+        self.edge_encoder = nn.Linear(2, edge_dim)  # edge_attr 是时间和priority
 
         # Time Embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
@@ -680,9 +680,8 @@ class LightweightIndustrialDiffusion(nn.Module):
             nn.Linear(hidden_dim, self.edge_out_dim)
         )
 
-    def forward(self, x, edge_index, batch, t, time_matrix=None):
-        # 1. Embedding Inputs
-        # x shape: [Num_Nodes, Feature_Dim] (One-hot or similar)
+    def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None):
+
         h = self.node_encoder(x.float())
 
         # Time Embedding
@@ -690,24 +689,38 @@ class LightweightIndustrialDiffusion(nn.Module):
         t_emb = self.time_embedder(t_tensor)  # [1, Hidden]
         # 将 t_emb 扩展到每个节点: [Num_Nodes, Hidden]
         t_emb_node = t_emb.repeat(h.size(0), 1)
-
+        src, dst = edge_index
+        
         # Edge Attributes 处理
         if time_matrix is not None:
-            src, dst = edge_index
-            # edge_times = time_matrix[src, dst].unsqueeze(-1)
-            # edge_attr = self.edge_encoder(edge_times)
             if time_matrix.size(0) < x.size(0):
                 num_nodes_per_graph = time_matrix.size(0)
                 edge_times = time_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
             else:
                 edge_times = time_matrix[src, dst].unsqueeze(-1)
                 # === [Batch Patch End] ===
-            edge_attr = self.edge_encoder(edge_times)
         else:
             print('no time metrix!!!')
-            edge_attr = torch.zeros((edge_index.size(1), 1), device=x.device)
-            edge_attr = self.edge_encoder(edge_attr)
-
+            edge_times = torch.zeros((edge_index.size(1), 1), device=x.device)
+            
+        if priorities is not None:
+            # 假设 priorities 是 [Batch, Num_Nodes] 或者 [Num_Nodes]
+            # 我们需要获取每条边源节点(src)对应的优先级
+            # 如果 priorities 是 [Num_Nodes]，直接索引
+            if priorities.dim() == 1:
+                edge_prios = priorities[src].unsqueeze(-1) 
+            elif priorities.dim() == 2 and priorities.size(0) == x.size(0):
+                 # 如果 priorities 是 [N, 1]
+                 edge_prios = priorities[src]
+            else:
+                 print('error code3745')
+                 edge_prios = torch.zeros_like(edge_times)
+        else:
+            # 默认优先级为 0.5 (中性) 或 0
+            edge_prios = torch.zeros_like(edge_times)
+            
+        raw_edge_attr = torch.cat([edge_times, edge_prios], dim=1)
+        edge_attr = self.edge_encoder(raw_edge_attr)
         # 2. Backbone Processing
         for layer in self.layers:
             # 传入 t_emb_node 用于 AdaLN
@@ -860,7 +873,9 @@ class LightweightIndustrialDiffusion(nn.Module):
         
         pos_bias_raw = (1.0 - norm_pos) * is_op_node
         pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
-        
+        current_priorities = torch.randn(total_nodes, device=device) * 0.5 + 0.5
+        current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
+                                           
         for t in range(self.T - 1, -1, -1):
 
             current_temp = self.get_temperature(t, self.T, start_temp, end_temp, method=temperature_method)
@@ -870,7 +885,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             global_u = u + b_idx * num_nodes_per_graph
             global_v = v + b_idx * num_nodes_per_graph
             edge_index_t = torch.stack([global_u, global_v], dim=0)
-            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix, priorities=current_priorities)
 ##########################################
             if edge_outputs_list:
                 # edge_output = edge_outputs_list[0]  # [B, N, N, 4]
@@ -943,21 +958,193 @@ class LightweightIndustrialDiffusion(nn.Module):
 
             relevant_priorities = priority_scores[:, op_indices, :]
             final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
-
-            if num_samples == 1:
-                e = e.squeeze(0)  # [N, N, C]
-                total_log_prob = total_log_prob.squeeze(0)
-                total_entropy = total_entropy.squeeze(0)
-                final_priorities = final_priorities.squeeze(0)
-                if return_trajectory:
-                    trajectory = [t.squeeze(0) for t in trajectory]
-
+            temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
+            temp_prio_matrix[:, op_indices] = final_priorities
+            current_priorities = temp_prio_matrix.view(-1)
+            
+        if num_samples == 1:
+            e = e.squeeze(0)  # [N, N, C]
+            total_log_prob = total_log_prob.squeeze(0)
+            total_entropy = total_entropy.squeeze(0)
+            final_priorities = final_priorities.squeeze(0)
             if return_trajectory:
-                return e, total_log_prob, total_entropy, final_priorities, trajectory
-            else:
-                return e, total_log_prob, total_entropy, final_priorities
+                trajectory = [t.squeeze(0) for t in trajectory]
 
+        if return_trajectory:
+            return e, total_log_prob, total_entropy, final_priorities, trajectory
+        else:
+            return e, total_log_prob, total_entropy, final_priorities
 
+    def refine_from_intermediate(self, noisy_e, data, device, start_t,
+                                 hint_priorities=None,
+                                 time_guidance_scale=0.1, position_guidance_scale=0.0,
+                                 temperature_method='cosine', start_temp=2.0, end_temp=0.1):
+        """
+        [Refinement Step]
+        接力 mutation：从中间时刻 start_t 开始，把变异后的粗糙图修补成完整解。
+        """
+        # 1. 初始化 Batch 信息
+        B = noisy_e.shape[0]
+        data_list = [data.clone() for _ in range(B)]
+        batch_data = Batch.from_data_list(data_list).to(device)
+        num_nodes_per_graph = data.x.size(0)
+        total_nodes = batch_data.x.size(0)
+        # 2. 继承变异后的边状态 (而不是像原函数那样初始化为全0)
+        e = noisy_e.clone()
+
+        # 3. 准备各种 Mask (直接复制原函数的逻辑)
+        x_single = data.x
+        node_types = x_single.argmax(dim=1)
+        allowed_mask_single = get_ipps_allowed_mask(node_types, data, device)
+        allowed_mask_batch = allowed_mask_single.unsqueeze(0).expand(B, -1, -1)
+
+        seq_edges_src = data.edge_index[0]
+        seq_edges_tgt = data.edge_index[1]
+        pinned_mask_single = torch.zeros((num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
+        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True
+        pinned_mask_batch = pinned_mask_single.unsqueeze(0).expand(B, -1, -1)
+
+        op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
+        machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
+
+        # 准备 Position Bias
+        x_dense, _ = to_dense_batch(batch_data.x, batch_data.batch)
+        is_op_node = (x_dense[:, :, 0] == 1).float()
+        norm_pos = x_dense[:, :, 2]
+        pos_bias_raw = (1.0 - norm_pos) * is_op_node
+        pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
+
+        if hint_priorities is not None:
+            # hint_priorities 是 [B, Num_Ops]
+            # 我们需要把它扩展到 [B, N] 并展平
+            temp_prio = torch.zeros((B, num_nodes_per_graph), device=device)
+            temp_prio[:, op_indices] = hint_priorities
+            current_priorities = temp_prio.view(-1) # [B*N]
+        else:
+            # 如果没有 Hint，就随机初始化
+            current_priorities = torch.randn(total_nodes, device=device) * 0.5 + 0.5
+        
+        current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
+                                     
+        final_priorities = None
+
+        # 4. 循环：从 start_t 开始倒数，而不是从 self.T 开始
+        #    这是唯一的区别！
+        for t in range(start_t, -1, -1):
+
+            # --- 以下逻辑与 reverse_diffusion_with_logprob 完全一致 ---
+            current_temp = self.get_temperature(t, self.T, start_temp, end_temp, method=temperature_method)
+
+            current_edge_labels = e.argmax(dim=-1)
+            b_idx, u, v = (current_edge_labels > 0).nonzero(as_tuple=True)
+            global_u = u + b_idx * num_nodes_per_graph
+            global_v = v + b_idx * num_nodes_per_graph
+            edge_index_t = torch.stack([global_u, global_v], dim=0)
+            # edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, 
+                                             t, data.time_matrix, priorities=current_priorities)
+            if edge_outputs_list:
+                edge_output = torch.stack(edge_outputs_list, dim=0)
+
+                # Priority Logic
+                prio_mean = edge_output[:, :, :, 2]
+                if position_guidance_scale > 0:
+                    prio_mean = prio_mean + pos_bias_tensor
+                prio_log_std = edge_output[:, :, :, 3]
+                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                scaled_prio_std = prio_std * current_temp + 1e-6
+                prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
+                raw_priority_sample = prio_dist.sample()
+                priority_scores = torch.sigmoid(raw_priority_sample)
+
+                # Routing Logic
+                edge_logits = edge_output[:, :, :, :2]
+                score_matrix = edge_logits[:, :, :, 1]
+                score_matrix = score_matrix - (data.time_matrix.unsqueeze(0) * time_guidance_scale)
+
+                new_e_indices = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph), dtype=torch.long,
+                                            device=device)
+                new_e_indices[pinned_mask_batch] = 1
+
+                op_machine_scores = score_matrix.clone() / current_temp
+                op_machine_scores[~allowed_mask_batch] = -1e9
+                valid_col_mask = torch.zeros_like(op_machine_scores, dtype=torch.bool)
+                valid_col_mask[:, :, machine_indices] = True
+                op_machine_scores[~valid_col_mask] = -1e9
+
+                target_scores = op_machine_scores[:, op_indices, :]
+                dist = torch.distributions.Categorical(logits=target_scores)
+                actions = dist.sample()
+
+                # 更新边状态 e
+                batch_idx_expanded = torch.arange(B, device=device).unsqueeze(1).expand(-1, len(op_indices))
+                op_indices_expanded = op_indices.unsqueeze(0).expand(B, -1)
+                new_e_indices[batch_idx_expanded, op_indices_expanded, actions] = 1
+                new_e_indices[pinned_mask_batch] = 1
+                e = torch.nn.functional.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
+
+                relevant_priorities = priority_scores[:, op_indices, :]
+                final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+                
+                temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
+                temp_prio_matrix[:, op_indices] = final_priorities
+                current_priorities = temp_prio_matrix.view(-1)
+
+        return e, final_priorities
+
+    def rl_structural_mutation(self, elite_edges_onehot, elite_priorities, t,
+                               base_mutation_scale=1.0,
+                               priority_noise_scale=0.3,  # 新增：控制优先级的变异幅度
+                               start_temp=2.0, end_temp=0.1,
+                               temperature_method='cosine'):
+        """
+        [Theory-Aligned Dual Mutation]
+        同时对 图结构(离散) 和 优先级(连续) 进行符合热力学的变异。
+        """
+
+        # 1. 计算归一化温度 (Entropy Level)
+        current_temp = self.get_temperature(
+            t, self.T, start_temp, end_temp, method=temperature_method
+        )
+        tau_min = end_temp
+        tau_max = start_temp
+        normalized_temp = (current_temp - tau_min) / (tau_max - tau_min + 1e-8)
+
+        # 限制范围 [0, 1]
+        mutation_intensity = torch.clamp(torch.tensor(normalized_temp), 0.0, 1.0).item()
+
+        # ==========================================
+        # Part A: 边的离散变异 (Discrete Mutation)
+        # ==========================================
+        edge_mutation_rate = mutation_intensity * base_mutation_scale
+        edge_mutation_rate = min(edge_mutation_rate, 1.0)  # 钳位
+
+        current_decisions = elite_edges_onehot.argmax(dim=-1)
+        rand_mask = torch.rand_like(current_decisions.float()) < edge_mutation_rate
+        random_decisions = torch.randint(0, self.edge_num_classes, current_decisions.shape, device=self.device)
+
+        mutated_indices = torch.where(rand_mask, random_decisions, current_decisions)
+        mutated_edges_onehot = F.one_hot(mutated_indices.long(), num_classes=self.edge_num_classes).float()
+
+        # ==========================================
+        # Part B: 优先级的连续变异 (Continuous Mutation)
+        # ==========================================
+        # 假设 elite_priorities 是 [B, Num_Ops] 且范围在 [0, 1] 之间
+        # 我们添加均值为 0，标准差与 Temperature 成正比的高斯噪声
+
+        # noise_std 随着温度升高而变大
+        current_noise_std = priority_noise_scale * mutation_intensity
+
+        # 生成高斯噪声
+        gaussian_noise = torch.randn_like(elite_priorities) * current_noise_std
+
+        # 叠加噪声
+        mutated_priorities = elite_priorities + gaussian_noise
+
+        # 重新钳位回有效范围 (例如 sigmoid 后的 0~1)
+        mutated_priorities = torch.clamp(mutated_priorities, 0.0, 1.0)
+
+        return mutated_edges_onehot, mutated_priorities, mutation_intensity
 
     def forward_diffusion(self, x0, e0, t, device):
         x_t_onehot = F.one_hot(x0, num_classes=self.node_num_classes).float()

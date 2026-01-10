@@ -20,25 +20,25 @@ from Evaluate import (
     graph_to_simulation_input
 )
 
-SEED = 42
+SEED = 65
 random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance"
+RUN_NAME = "rl_new0110_T_SCALER0.01"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 2e-5   #learning rate
-EPOCHS = 3000
+EPOCHS = 1000
 BATCH_SIZE = 32
-T_STEPS = 4
+T_STEPS = 8
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
 ENTROPY_START = 0.1
-ENTROPY_END = 0.01
-DECAY_STEPS = 1000
-T_SCALER = 0.001
+ENTROPY_END = 0.001
+DECAY_STEPS = 500
+T_SCALER = 0.01
 POS_SCALER = 2.0
 VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
@@ -273,6 +273,12 @@ for epoch in range(EPOCHS):
         loss_policy = -(selected_advantages * selected_log_probs).mean()
         loss_entropy = -selected_entropies.mean()
 
+        if epoch % 50 == 0:
+            loss_policy_magnitude = (selected_advantages * selected_log_probs).abs().mean()
+            print(f'   >>> [Debug] Net Policy Loss: {loss_policy.item():.4f} | '
+                  f'Abs Magnitude: {loss_policy_magnitude.item():.4f} | ' # <--- 关注这个！
+                  f'Weighted Entropy: {(current_entropy_coef * loss_entropy).item():.4f}')
+        
         loss = loss_policy + current_entropy_coef * loss_entropy
 
         # Backward
