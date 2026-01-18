@@ -7,7 +7,7 @@ import sys
 import copy
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from Industrial_Pipeline_Functions import load_ipps_problem_from_json, get_ipps_problem_data
 import random
 
@@ -124,11 +124,16 @@ def calculate_energy_consumption(completed_operations: List[Dict], makespan: flo
     return energy_consumption
 
 
-def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_data: Dict) -> Tuple[
-    Dict, Dict, List[Dict]]:
+def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_data: Dict, time_uncertainty: float = 0.0, seed: Optional[int] = 42) -> Tuple[Dict, Dict, List[Dict]]:
     # ==========================================
     # 1. 初始化与严格定序
     # ==========================================
+    if seed is not None:
+        # 创建一个局部的随机实例，这样不会干扰全局的 random 状态
+        rng = random.Random(seed)
+    else:
+        # 如果没给种子，就使用默认的全局 random
+        rng = random
     all_ops_map = {}
     machine_queues = {m: [] for m in machine_power_data.keys()}
     total_ops_count = 0
@@ -138,15 +143,29 @@ def simulate_complete_scheduling(workpiece_cycles: List[Tuple], machine_power_da
             wp_name, selected_machines, processing_times, priorities = item
         else:
             wp_name, selected_machines, processing_times = item
-            priorities = [random.random() for _ in range(len(selected_machines))]
+            priorities = [rng.random() for _ in range(len(selected_machines))]
 
-        for feature_idx, (mid, proc_time, priority) in enumerate(zip(selected_machines, processing_times, priorities)):
+        for feature_idx, (mid, base_proc_time, priority) in enumerate(zip(selected_machines, processing_times, priorities)):
             current_feat = feature_idx + 1
+            
+            if time_uncertainty > 0:
+                # 生成 [-uncertainty, +uncertainty] 之间的随机比例
+                # 例如 uncertainty=0.1, 则 scale 在 0.9 到 1.1 之间
+                fluctuation = rng.uniform(-time_uncertainty, time_uncertainty)
+                actual_time = base_proc_time * (1 + fluctuation)
+                # 保护机制：防止时间变成负数或0，最小保留 0.1
+                final_proc_time = max(0.1, actual_time)
+            else:
+                final_proc_time = base_proc_time
+                
+            
             operation = {
                 'workpiece': wp_name,
                 'feature': current_feat,
                 'machine': mid,
-                'processing_time': proc_time,
+                'processing_time': final_proc_time, # 使用计算后的实际时间
+                'original_time': base_proc_time,
+                # 'processing_time': proc_time,
                 'priority': priority,
                 'start_time': None,
                 'end_time': None

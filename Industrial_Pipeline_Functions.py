@@ -11,138 +11,6 @@ import random
 from torch.distributions import Normal
 from torch_geometric.nn import TransformerConv, GlobalAttention
 
-
-class IndustrialGraphDataset(InMemoryDataset):
-    def __init__(self, root, transform=None, pre_transform=None):
-        super().__init__(root, transform, pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
-
-    @property
-    def raw_file_names(self):
-        return ['Dataset.xlsx']
-
-    @property
-    def processed_file_names(self):
-        return ['processed_graphs.pt']
-
-    def download(self):
-        pass
-
-    def process(self):
-
-        df = pd.read_excel(self.raw_paths[0])
-
-        machine_cols = sorted(
-            [col for col in df.columns if col.startswith('Workpiece') and col.endswith('machines')],
-            key=lambda x: int(x.split('_')[0].replace('Workpiece', ''))
-        )
-
-        node_type_to_idx = {'OPERATION': 0, 'MACHINE': 1}
-        num_node_classes = 2
-
-        data_list = []
-
-        for _, row in df.iterrows():
-
-            op_node_index_counter = 0
-            all_ops_info = []  # (op_node_idx, machine_id_from_excel)
-            all_machine_ids_in_graph = set()
-
-            source_edges = []
-            target_edges = []
-
-            for col_name in machine_cols:
-                if pd.isna(row[col_name]):
-                    continue
-
-                machine_list_str = str(row[col_name])
-
-                try:
-                    # 使用 ast.literal_eval 安全解析 "[6, 2, 1]"
-                    machine_indices = ast.literal_eval(machine_list_str)
-                except Exception as e:
-                    print(f"error: {_.name}, column {col_name} Error: {e} skipped")
-                    continue
-
-                ops_for_this_workpiece = []
-
-                for machine_idx in machine_indices:
-                    op_idx = op_node_index_counter
-
-                    ops_for_this_workpiece.append(op_idx)
-                    all_ops_info.append((op_idx, machine_idx))
-                    all_machine_ids_in_graph.add(machine_idx)
-
-                    op_node_index_counter += 1
-
-                # add edges among operations inside the same workpiece
-                for i in range(len(ops_for_this_workpiece) - 1):
-                    u = ops_for_this_workpiece[i]
-                    v = ops_for_this_workpiece[i + 1]
-                    source_edges.append(u)
-                    target_edges.append(v)
-
-            num_operation_nodes = op_node_index_counter
-
-            unique_machine_ids = sorted(list(all_machine_ids_in_graph))
-            num_machine_nodes = len(unique_machine_ids)
-
-            machine_id_to_graph_idx_map = {
-                machine_id: i + num_operation_nodes
-                for i, machine_id in enumerate(unique_machine_ids)
-            }
-
-            op_labels = torch.full((num_operation_nodes,),
-                                   fill_value=node_type_to_idx['OPERATION'],
-                                   dtype=torch.long)
-
-            machine_labels = torch.full((num_machine_nodes,),
-                                        fill_value=node_type_to_idx['MACHINE'],
-                                        dtype=torch.long)
-
-            all_labels = torch.cat([op_labels, machine_labels])
-            x = F.one_hot(all_labels, num_classes=num_node_classes).float()
-
-            for op_idx, machine_id in all_ops_info:
-                u = op_idx
-                if machine_id not in machine_id_to_graph_idx_map:
-                    continue
-                v = machine_id_to_graph_idx_map[machine_id]
-                source_edges.append(u)
-                target_edges.append(v)
-
-            edge_index = torch.tensor([source_edges, target_edges], dtype=torch.long)
-
-            edge_attr = torch.ones((edge_index.size(1), 1), dtype=torch.float)
-
-            y = None
-            if 'makespan' in df.columns:
-                y = torch.tensor([row['makespan']], dtype=torch.float)
-
-            data = Data(x=x,
-                        edge_index=edge_index,
-                        edge_attr=edge_attr,
-                        y=y,
-                        n_nodes=x.size(0))
-
-            data_list.append(data)
-
-        data, slices = self.collate(data_list)
-        torch.save((data, slices), self.processed_paths[0])
-
-    def weighted_repeat_inplace(self, repeat_list):
-        assert len(repeat_list) == len(self), "length of repeat_list must equal to the length of the dataset"
-
-        data_list = [self.get(i) for i in range(len(self))]
-        new_data_list = []
-        for data, repeat_times in zip(data_list, repeat_list):
-            for _ in range(repeat_times):
-                new_data_list.append(data.clone())
-
-        self.data, self.slices = self.collate(new_data_list)
-        print(f"Dataset length changed from {len(data_list)} to {len(new_data_list)}")
-
-
 # 2 Industrial Diffusion Model
 import torch
 import torch.nn as nn
@@ -155,9 +23,6 @@ import os
 from torch_geometric.data import Batch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Definir constantes para claridad
-# MACHINE, BUFFER, ASSEMBLY, DISASSEMBLY = 0, 1, 2, 3
 
 OPERATION, MACHINE = 0, 1
 
@@ -202,21 +67,17 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
             machine_graph_idx = num_ops + m_idx_in_list
 
             time_matrix[i, machine_graph_idx] = t_val / max_time
-
-    # op_labels = torch.full((num_ops,), 0, dtype=torch.long)
-    # machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
-    # all_labels = torch.cat([op_labels, machine_labels])
-    # x = F.one_hot(all_labels, num_classes=2).float().to(device)
     op_labels = torch.full((num_ops,), 0, dtype=torch.long)
     machine_labels = torch.full((num_machines,), 1, dtype=torch.long)
     all_labels = torch.cat([op_labels, machine_labels]).to(device)
     type_onehot = F.one_hot(all_labels, num_classes=2).float()
 
     # Position, Workload, Connectivity
-    extra_feats = torch.zeros((num_nodes, 3), device=device)
+    extra_feats = torch.zeros((num_nodes, 5), device=device)
 
     extra_feats[num_ops:, 0] = -1.0
-
+    extra_feats[num_ops:, 3:] = -1.0
+    
     for i in range(num_ops):  # step number
         wp_idx, feat_idx = op_info_list[i]
         total_feats = len(problem_workpieces[wp_idx]["optional_machines"])
@@ -232,21 +93,31 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
     # connection for every op
     op_conn = (sub_matrix > 0).float().sum(dim=1)
     # average process time for every op
-    op_load = sub_matrix.sum(dim=1) / op_conn.clamp(min=1.0)
-
+    # op_load = sub_matrix.sum(dim=1) / op_conn.clamp(min=1.0)
+    
+    temp_sub = sub_matrix.clone()
+    temp_sub[temp_sub == 0] = float('inf')
+    op_min_time, _ = temp_sub.min(dim=1) # [Num_Ops]
+    # # 把之前无穷大的改回 0 (针对那些没有任何机器可选的极端情况，虽不常见)
+    # op_min_time[op_min_time == float('inf')] = 0.0
+    op_max_time, _ = sub_matrix.max(dim=1) # [Num_Ops]
+    op_avg_time = sub_matrix.sum(dim=1) / op_conn.clamp(min=1.0)
+    
     # how many operations can be processed in this machine
     m_conn = (sub_matrix > 0).float().sum(dim=0)
     # average process time for every machine
     m_load = sub_matrix.sum(dim=0) / m_conn.clamp(min=1.0)
 
     # Op Features 0. type 1. average processtime 2.
-    extra_feats[:num_ops, 1] = op_load  # Workload
+    extra_feats[:num_ops, 1] = op_avg_time  # Workload
     extra_feats[:num_ops, 2] = op_conn / num_machines  # Connectivity (归一化)
-
+    extra_feats[:num_ops, 3] = op_min_time
+    extra_feats[:num_ops, 4] = op_max_time
+    
     extra_feats[num_ops:, 1] = m_load  # Workload
     extra_feats[num_ops:, 2] = m_conn / num_ops  # Connectivity (归一化)
+   
 
-    # x shape: [Num_Nodes, 2 + 3] = [Num_Nodes, 5]
     x = torch.cat([type_onehot, extra_feats], dim=1)
 
     op_info = torch.tensor(op_info_list, dtype=torch.long).to(device)
@@ -272,6 +143,21 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
     data.machine_map = machine_map  # [N_machines] (machine_id)
     data.time_matrix = time_matrix
 
+    min_time_expanded = op_min_time.unsqueeze(1).expand(-1, num_machines)
+    
+    # 计算优势矩阵 (Op-Machine部分)
+    # 注意：只针对 sub_matrix > 0 的部分计算
+    advantage_sub_matrix = torch.zeros_like(sub_matrix)
+    mask = sub_matrix > 0
+    # 相对偏差： (Time - Min) / Min
+    advantage_sub_matrix[mask] = (sub_matrix[mask] - min_time_expanded[mask]) / (min_time_expanded[mask] + 1e-6)
+    
+    # 放入完整的 advantage_matrix
+    advantage_matrix = torch.zeros((num_nodes, num_nodes), device=device)
+    advantage_matrix[:num_ops, num_ops:] = advantage_sub_matrix
+    
+    data.advantage_matrix = advantage_matrix
+    
     return data
 
 
@@ -422,134 +308,6 @@ def kl_divergence(pred_probs, marginal_probs):
     return kl.mean()
 
 
-def compute_batch_loss(model, batch_data, T, device, edge_weight, node_marginal, edge_marginal, kl_lambda=0.1,
-                       constraint_lambda=1.0):
-    data_list = batch_data.to_data_list()
-    total_loss = 0.0
-    count = 0
-    for data in data_list:
-        true_n = data.n_nodes.item() if hasattr(data, 'n_nodes') else data.x.size(0)
-        if true_n == 0:
-            continue
-
-        x0 = data.x[:true_n].argmax(dim=1)
-        dense_adj = to_dense_adj(data.edge_index, max_num_nodes=true_n)[0]
-        e0 = (dense_adj > 0).long()
-
-        t_i = torch.randint(0, T, (1,)).item()
-        x_t, e_t = model.forward_diffusion(x0, e0, t_i, device)
-
-        edge_index_noisy = (e_t.argmax(dim=-1) > 0).nonzero(as_tuple=False).t().contiguous()
-        data_i = Data(x=x_t, edge_index=edge_index_noisy)
-        data_i.batch = torch.zeros(x_t.size(0), dtype=torch.long, device=device)
-        node_logits, edge_logits_list = model(data_i.x, data_i.edge_index, data_i.batch, t=t_i)
-
-        loss_node = F.cross_entropy(node_logits, x0.to(device))
-
-        if edge_logits_list and edge_logits_list[0].numel() > 0:
-            edge_logits = edge_logits_list[0]
-            loss_edge = F.cross_entropy(edge_logits.view(-1, model.edge_num_classes),
-                                        e0.to(device).view(-1),
-                                        weight=edge_weight)
-        else:
-            loss_edge = 0.0
-
-        ### !!!!!!!!!!!tbd
-        ### here the calculation may has problems, the kl divergence is calculated one by one instead of for the whome distribution
-        ## tbd tmp needless for now, since every operation node must have exactly one connection, this is promised by projector
-        # node_probs = F.softmax(node_logits, dim=1)
-        # kl_node = kl_divergence(node_probs, node_marginal.to(device))
-        # if edge_logits_list and edge_logits_list[0].numel() > 0:
-        #     edge_logits = edge_logits_list[0]
-        #     edge_probs = F.softmax(edge_logits, dim=-1)
-        #     edge_probs_avg = edge_probs.view(-1, model.edge_num_classes)
-        #     kl_edge = kl_divergence(edge_probs_avg, edge_marginal.to(device))
-        # else:
-        #     kl_edge = 0.0
-        kl_node = 0.0
-        kl_edge = 0.0
-
-        #         ### !!!!!!!!!!!tbd
-        #         ### change to cross-entropy too
-        #         if edge_logits_list and edge_logits_list[0].numel() > 0:
-        #             # edge_probs = F.softmax(edge_logits, dim=-1)
-        #             # pred_edge_prob = edge_probs[..., 1]
-        #             # forbidden_mask = get_forbidden_mask(x0, device)
-        #             # forbidden_mask = forbidden_mask[:true_n, :true_n]
-        #             # constraint_loss = F.mse_loss(pred_edge_prob * forbidden_mask, torch.zeros_like(pred_edge_prob))
-        #
-        #             edge_logits = edge_logits_list[0]
-        #             forbidden_mask = get_forbidden_mask(x0, device)
-        #             forbidden_mask = forbidden_mask[:true_n, :true_n]
-        #             target_labels = torch.zeros(true_n, true_n, dtype=torch.long, device=device)
-        #             ce_loss_all_positions = F.cross_entropy(
-        #                 edge_logits.view(-1, model.edge_num_classes),
-        #                 target_labels.view(-1),
-        #                 reduction='none'
-        #             )
-        #             ce_loss_all_positions = ce_loss_all_positions.view(true_n, true_n)
-        #             ce_loss_masked = ce_loss_all_positions * forbidden_mask.float()
-        #             constraint_loss = ce_loss_masked.sum() / (forbidden_mask.sum() + 1e-8)
-        #         else:
-        #             constraint_loss = 0.0
-        # #############################################
-        #
-        #         constraint_validate_loss = torch.tensor(0.0, device=device)
-        #
-        #         if edge_logits_list and edge_logits_list[0].numel() > 0:
-        #             edge_logits = edge_logits_list[0]
-        #             edge_probs = F.softmax(edge_logits, dim=-1)
-        #             flat_probs = edge_probs.view(-1, model.edge_num_classes)
-        #
-        #             # x_labels = torch.multinomial(node_probs, num_samples=1).squeeze(1)
-        #             x_labels = torch.argmax(node_probs, dim=1)
-        #             # current_node_labels 就是 x_labels，我们直接用 x_labels
-        #
-        #             # sampled_flat = torch.multinomial(flat_probs, num_samples=1).view(-1)
-        #             sampled_flat = torch.argmax(flat_probs, dim=-1)
-        #             candidate_edge_matrix = sampled_flat.view(true_n, true_n)
-        #             projected = candidate_edge_matrix
-        #
-        #             if not validate_constraints(projected, x_labels, device, exact=True):
-        #                 reward = -0.01
-        #             else:
-        #                 reward = 0.01
-        #
-        #
-        #             node_log_probs = F.log_softmax(node_logits, dim=1)
-        #             edge_log_probs = F.log_softmax(edge_logits.view(-1, model.edge_num_classes), dim=-1)
-        #
-        #             picked_node_log_probs = node_log_probs.gather(1, x_labels.unsqueeze(1)).sum()
-        #             picked_edge_log_probs = edge_log_probs.gather(1, sampled_flat.unsqueeze(1)).sum()
-        #
-        #             constraint_validate_loss = - (picked_node_log_probs + picked_edge_log_probs) * torch.tensor(reward,
-        #                                                                                                         device=device).detach()
-
-        constraint_loss = torch.tensor(0.0, device=device)
-        constraint_validate_loss = torch.tensor(0.0, device=device)
-
-        loss = loss_node + loss_edge + kl_lambda * (
-                    kl_node + kl_edge) + constraint_lambda * constraint_loss + constraint_lambda * constraint_validate_loss
-        total_loss += loss
-        count += 1
-
-    avg_loss = total_loss / count if count > 0 else torch.tensor(0.0, device=device)
-    return avg_loss
-
-
-def train_model(model, dataloader, optimizer, device, edge_weight, node_marginal, edge_marginal, epochs=20, T=100):
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in dataloader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-            loss = compute_batch_loss(model, batch, T, device, edge_weight, node_marginal, edge_marginal)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(dataloader):.4f}")
-
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_dim, frequency_embedding_size=256):
@@ -635,7 +393,7 @@ class ResGNNBlock(nn.Module):
 # 3. 主模型：ComplexIndustrialDiffusion
 # ----------------------------------------------------------------
 class LightweightIndustrialDiffusion(nn.Module):
-    def __init__(self, T=100, input_dim=5, hidden_dim=128, num_layers=6,
+    def __init__(self, T=100, input_dim=7, hidden_dim=128, num_layers=6,
                  beta_start=0.0001, beta_end=0.02, nhead=4, dropout=0.1,
                  device='cuda', edge_dim=16):
         super().__init__()
@@ -649,7 +407,7 @@ class LightweightIndustrialDiffusion(nn.Module):
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.edge_encoder = nn.Linear(2, edge_dim)  # edge_attr 是时间和priority
+        self.edge_encoder = nn.Linear(3, edge_dim)  # edge_attr 是时间和priority
 
         # Time Embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
@@ -680,7 +438,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             nn.Linear(hidden_dim, self.edge_out_dim)
         )
 
-    def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None):
+    def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None, advantage_matrix=None):
 
         h = self.node_encoder(x.float())
 
@@ -702,6 +460,11 @@ class LightweightIndustrialDiffusion(nn.Module):
         else:
             print('no time metrix!!!')
             edge_times = torch.zeros((edge_index.size(1), 1), device=x.device)
+
+        if advantage_matrix is not None:
+            edge_advs = advantage_matrix[src, dst].unsqueeze(-1)
+        else:
+            edge_advs = torch.zeros_like(edge_times)
             
         if priorities is not None:
             # 假设 priorities 是 [Batch, Num_Nodes] 或者 [Num_Nodes]
@@ -719,7 +482,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             # 默认优先级为 0.5 (中性) 或 0
             edge_prios = torch.zeros_like(edge_times)
             
-        raw_edge_attr = torch.cat([edge_times, edge_prios], dim=1)
+        raw_edge_attr = torch.cat([edge_times, edge_advs, edge_prios], dim=1)
         edge_attr = self.edge_encoder(raw_edge_attr)
         # 2. Backbone Processing
         for layer in self.layers:
@@ -833,7 +596,7 @@ class LightweightIndustrialDiffusion(nn.Module):
     def reverse_diffusion_with_logprob(self, data, device, num_samples=1,
                                        time_guidance_scale=0.1, position_guidance_scale=0.0,
                                        return_trajectory=False, temperature_method='cosine',
-                                       start_temp=2.0, end_temp=0.1):
+                                       start_temp=2.0, end_temp=0.1, greedy=False):
         """
         For RL sampling
         """
@@ -900,7 +663,13 @@ class LightweightIndustrialDiffusion(nn.Module):
                 scaled_prio_std = prio_std * current_temp + 1e-6
 
                 prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
-                raw_priority_sample = prio_dist.sample()
+                if greedy:
+                    # Greedy模式：直接使用均值 (正态分布的均值即众数/概率最大处)
+                    raw_priority_sample = prio_mean
+                else:
+                    # Stochastic模式：从分布采样
+                    raw_priority_sample = prio_dist.sample()
+
                 priority_scores = torch.sigmoid(raw_priority_sample)
 
                 # --- Routing ---
@@ -927,7 +696,13 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 # Sample
                 dist = torch.distributions.Categorical(logits=target_scores)
-                actions = dist.sample()  # [B, Num_Ops]
+                if greedy:
+                    # Greedy模式：选择概率最大的动作 (Argmax)
+                    actions = torch.argmax(target_scores, dim=-1)
+                else:
+                    # Stochastic模式：按概率采样
+                    actions = dist.sample()
+                # actions = dist.sample()  # [B, Num_Ops]
 
                 # --- Metrics ---
                 # Log Prob
@@ -1248,304 +1023,3 @@ class LightweightIndustrialDiffusion(nn.Module):
         final_nodes, final_edges, _ = self.reverse_diffusion_single(data, self.device, False)
         node_types = final_nodes
         return node_types, final_edges
-
-
-# 3 Industrial Training Script
-# train_industrial.py  ── versión cronometrada
-import os, time, argparse, torch
-from torch_geometric.loader import DataLoader
-from torch_geometric.utils import to_dense_adj
-
-
-# ---------- utilidades para pesos y marginales ----------
-def compute_edge_weights(dataset, device):
-    total_edges = 0
-    class_counts = torch.zeros(2, device=device)
-    for data in dataset:
-        dense = to_dense_adj(data.edge_index,
-                             max_num_nodes=data.x.size(0))[0]
-        e0 = (dense > 0).long()
-        class_counts += torch.bincount(e0.view(-1), minlength=2).to(device)
-        total_edges += e0.numel()
-    class_counts[class_counts == 0] = 1.0
-    w = total_edges / (2.0 * class_counts)
-    return w / w.sum()
-
-
-def compute_marginal_probs(dataset, device):
-    node_counts = torch.zeros(2, device=device)  # 4 tipos de nodo
-    edge_counts = torch.zeros(2, device=device)
-    n_nodes = n_edges = 0
-    for data in dataset:
-        labels = data.x.argmax(dim=1)
-        node_counts += torch.bincount(labels, minlength=2).float().to(device)
-        n_nodes += data.x.size(0)
-        dense = to_dense_adj(data.edge_index,
-                             max_num_nodes=data.x.size(0))[0]
-        e0 = (dense > 0).long()
-        edge_counts += torch.bincount(e0.view(-1), minlength=2).float().to(device)
-        n_edges += e0.numel()
-    return node_counts / n_nodes, edge_counts / n_edges
-
-
-# --------------------------------------------------------
-
-
-def run_training(epochs=30, batch=4, lr=1e-3):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ckpt = 'industrial_model.pth'
-    if os.path.exists(ckpt):
-        print(f"⚠️  Found existing weights: {ckpt}. Skipping training.")
-        return
-    dataset = IndustrialGraphDataset(root='industrial_dataset')
-    loader = DataLoader(dataset, batch_size=batch, shuffle=True)
-
-    edge_w = compute_edge_weights(dataset, device)
-    node_m, edge_m = compute_marginal_probs(dataset, device)
-
-    model = LightweightIndustrialDiffusion(device=device).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    print(f"\n▶ Training INDUSTRIAL model  ({len(dataset)} graphs)")
-    start = time.perf_counter()
-
-    train_model(model, loader, optimizer, device,
-                edge_weight=edge_w,
-                node_marginal=node_m,
-                edge_marginal=edge_m,
-                epochs=epochs, T=100)
-
-    elapsed = time.perf_counter() - start
-    print(f"⏱  Finished in {elapsed / 60:.1f} min  ({elapsed:.1f} s)\n")
-
-    torch.save(model.state_dict(), 'industrial_model.pth')
-    print("✅ Weights saved to  industrial_model.pth")
-
-
-# -------------- entry point con argparse -----------------
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=30,
-                        help='Número de épocas de entrenamiento')
-    parser.add_argument('--batch', type=int, default=4,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    args = parser.parse_args()
-
-    run_training(epochs=args.epochs,
-                 batch=args.batch,
-                 lr=args.lr)
-
-# 4 Industrial Running functions
-import time, random, collections
-import torch, networkx as nx
-import numpy as np
-from torch_geometric.data import Batch
-from torch_geometric.nn import global_mean_pool, GINConv
-from torch.utils.data import DataLoader
-
-
-# --------------------------------------------------------------------------
-# Helpers for hashing and validity
-# --------------------------------------------------------------------------
-def plant_valid(node_labels: torch.Tensor, edge_mat: torch.Tensor, device):
-    """True iff plant-level constraints C1–C6 hold."""
-    return validate_constraints(edge_mat, node_labels, device)
-
-
-def wl_hash(node_labels: torch.Tensor, edge_mat: torch.Tensor) -> str:
-    """Deterministic hash ( Weisfeiler-Lehman ) for isomorphism tests."""
-    G = nx.DiGraph()
-    n = len(node_labels)
-    for i in range(n):
-        G.add_node(i, t=int(node_labels[i]))
-    src, dst = torch.nonzero(edge_mat, as_tuple=True)
-    for s, d in zip(src.tolist(), dst.tolist()):
-        G.add_edge(s, d)
-    return nx.weisfeiler_lehman_graph_hash(G, node_attr='t')
-
-
-# LABEL2ID = {"MACHINE": 0,
-#             "BUFFER":  1,
-#             "ASSEMBLY":2,
-#             "DISASSEMBLY":3}
-LABEL2ID = {"OPERATION": 0, "MACHINE": 1}
-
-from pathlib import Path
-import datetime as dt
-import numpy as np
-from typing import Union
-
-
-def _save_graphs_pt(tag: str, batch: list[dict], save_dir: Union[str, Path]) -> None:
-    """
-    Save a batch of graphs to a .pt file with the same schema as graphs_data_int.pt
-    Keys:
-      ├ adjacency_matrices : list[np.ndarray]  (int8/uint8)
-      ├ node_types         : list[np.ndarray]  (int8)
-      └ label2id           : dict[str,int]
-    """
-    from pathlib import Path
-    import datetime as dt
-
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    adj_list, node_list = [], []
-    for g in batch:
-        adj_list.append(g["edges"].cpu().numpy().astype(np.uint8))
-        node_list.append(g["nodes"].cpu().numpy().astype(np.int8))
-
-    payload = {
-        "adjacency_matrices": adj_list,
-        "node_types": node_list,
-        "label2id": LABEL2ID
-    }
-
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = save_dir / f"{tag}_{stamp}.pt"
-    torch.save(payload, fname)
-    print(f"   ↳ Graphs saved in {fname}")
-    return fname
-
-
-# --------------------------------------------------------------------------
-# Experiment E1 – free generation
-# --------------------------------------------------------------------------
-def experiment_free(n_samples=300, n_nodes=15, plant_model_path="ablation_runs_new/baseline/model.pth"):
-    batch = []
-    t0 = time.time()
-    for _ in tqdm(range(n_samples)):
-        model = LightweightIndustrialDiffusion(device=device).to(device)
-        model.load_state_dict(torch.load(plant_model_path,
-                                         map_location=device))
-        nodes, edges = model.generate_global_graph(n_nodes)
-        batch.append({"nodes": nodes,
-                      "edges": edges.squeeze(0)})
-    runtime = time.time() - t0
-    print(f"[E1-Free]   {n_samples} samples in {runtime:.1f}s")
-    # print(evaluate(batch), "\n")
-    # extra_metrics(batch, tag="[E1]")
-    file_name = _save_graphs_pt("E1", batch, save_dir="exp_outputs/E1/pt_file")
-    return file_name
-
-
-# --------------------------------------------------------------------------
-# Experiment E2 – all-pinned inventory
-# --------------------------------------------------------------------------
-def experiment_allpinned(n_samples=300,
-                         inv=(3, 4, 2, 1), plant_model_path="ablation_runs_new/baseline/model.pth"):  # (M, B, A, D)
-    numM, numB, numA, numD = inv
-    batch = []
-    t0 = time.time()
-    for _ in tqdm(range(n_samples)):
-        model = LightweightIndustrialDiffusion(device=device).to(device)
-        model.load_state_dict(torch.load(plant_model_path,
-                                         map_location=device))
-        nodes, edges = model.generate_global_graph_all_pinned(
-            num_machines=numM,
-            num_buffers=numB,
-            num_assemblies=numA,
-            num_disassemblies=numD)
-        ok_inv = ((nodes == 0).sum() == numM and
-                  (nodes == 1).sum() == numB and
-                  (nodes == 2).sum() == numA and
-                  (nodes == 3).sum() == numD)
-        batch.append({"nodes": nodes,
-                      "edges": edges.squeeze(0),
-                      "success": ok_inv})
-    runtime = time.time() - t0
-    print(f"[E2-AllPinned] {n_samples} samples in {runtime:.1f}s")
-    # print(evaluate(batch), "\n")
-    # extra_metrics(batch, tag="[E2]")
-    file_name = _save_graphs_pt("E2", batch, save_dir="exp_outputs/E2/pt_file")
-    return file_name
-
-
-# --------------------------------------------------------------------------
-# Experiment E3 – partial-pinned (30 % nodes)
-# --------------------------------------------------------------------------
-def experiment_partial(n_samples=300, n_nodes=20, pin_ratio=0.3,
-                       plant_model_path="ablation_runs_new/baseline/model.pth"):
-    batch = []
-    t0 = time.time()
-    for _ in tqdm(range(n_samples)):
-        pin_counts = {"MACHINE": 1,
-                      "ASSEMBLY": 1,
-                      "BUFFER": int(pin_ratio * n_nodes) - 2}
-        model = LightweightIndustrialDiffusion(device=device).to(device)
-        model.load_state_dict(torch.load(plant_model_path,
-                                         map_location=device))
-        nodes, edges = model.generate_global_graph_partial_pinned(
-            num_nodes=n_nodes,
-            pinned_info=pin_counts)
-        batch.append({"nodes": nodes,
-                      "edges": edges.squeeze(0)})
-    runtime = time.time() - t0
-    print(f"[E3-Partial] {n_samples} samples in {runtime:.1f}s")
-    # print(evaluate(batch), "\n")
-    # extra_metrics(batch, tag="[E3]")
-    file_name = _save_graphs_pt("E3", batch, save_dir="exp_outputs/E3/pt_file")
-    return file_name
-
-
-# ───────────── extra: FID / MMD ───────────────────────────────
-
-class GraphEncoder(torch.nn.Module):
-    """Mini-GIN → mean-pool → linear  (128-D por defecto)."""
-
-    def __init__(self, in_dim=2, hid=64, out=128):
-        super().__init__()
-        mlp = torch.nn.Sequential(torch.nn.Linear(in_dim, hid),
-                                  torch.nn.ReLU(),
-                                  torch.nn.Linear(hid, hid))
-        self.conv = GINConv(mlp)
-        self.lin = torch.nn.Linear(hid, out)
-
-    def forward(self, batch):
-        h = self.conv(batch.x, batch.edge_index)
-        h = global_mean_pool(h, batch.batch)  # (B, hid)
-        return self.lin(h)  # (B, out)
-
-
-@torch.no_grad()
-def encode_graphs(list_dicts, encoder, device='cpu', bs=64):
-    """Convierte tu lista de dicts {'nodes','edges'} en embeddings."""
-    data_objs = []
-    for g in list_dicts:
-        x = torch.nn.functional.one_hot(g["nodes"], num_classes=2).float()
-        edge_idx = (g["edges"] > 0).nonzero(as_tuple=False).t().contiguous()
-        from torch_geometric.data import Data
-        data_objs.append(Data(x=x, edge_index=edge_idx))
-    loader = DataLoader(data_objs, bs, shuffle=False,
-                        collate_fn=Batch.from_data_list)
-    Z = []
-    for batch in loader:
-        Z.append(encoder(batch.to(device)).cpu())
-    return torch.cat(Z, 0)  # (N, d)
-
-
-def frechet(mu1, cov1, mu2, cov2):
-    diff = mu1 - mu2
-    covmean = cov_sqrt(cov1 @ cov2)
-    return diff.dot(diff) + torch.trace(cov1 + cov2 - 2 * covmean)
-
-
-def cov_sqrt(mat, eps=1e-8):
-    # mat: (d,d) simétrica PSD
-    evals, evecs = torch.linalg.eigh(mat)
-    evals_clamped = torch.clamp(evals, min=0.)  # num. safety
-    return (evecs * evals_clamped.sqrt()) @ evecs.t()
-
-
-def mmd_rbf(X, Y):
-    # bandwidth heurístico (mediana)
-    Z = torch.cat([X, Y], 0)
-    sq = torch.cdist(Z, Z, p=2.0) ** 2
-    sigma = torch.sqrt(0.5 * sq[sq > 0].median())
-    k = lambda A, B: torch.exp(-torch.cdist(A, B, p=2.0) ** 2 / (2 * sigma ** 2))
-    m, n = len(X), len(Y)
-    return (k(X, X).sum() - m) / (m * (m - 1)) \
-           + (k(Y, Y).sum() - n) / (n * (n - 1)) \
-           - 2 * k(X, Y).mean()

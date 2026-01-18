@@ -23,8 +23,8 @@ from Evaluate import (
 )
 from Generate_random_problem_instances import generate_random_ipps_problem
 
-model_weight_path = 'rl_new1219_2'
-MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep999.pth"
+model_weight_path = 'rl_new0110_decay_scaler(TScaler0.01)_introduce_advantage_resume_from_ep999(LR1e-7)'
+MODEL_PATH = f"rl_checkpoints/{model_weight_path}/model_ep599.pth"
 base_dir = f"rl_checkpoints/{model_weight_path}"
 config_path = os.path.join(base_dir, "config.json")
 if os.path.exists(config_path):
@@ -38,14 +38,18 @@ NUM_MACHINES = [5, 5, 10, 10]  # 固定机器数量，模拟车间规模
 OUTPUT_FILE = f"generalization_test_results_{model_weight_path}.json"
 NUM_INSTANCES = 10  # 每个尺寸生成多少个问题
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TIME_GUIDANCE_SCALE = config.get("T_SCALER", 0.001)
+UNCERTAINTY_LEVEL = 0
 
 T_STEPS = config.get("T_STEPS", 8)
 print(f'T_STEPS{T_STEPS}')
 HIDDEN_DIM = config.get("HIDDEN_DIMENSION", 128)
 NUM_LAYERS = config.get("NUM_LAYERS", 6)
 N_HEADS = config.get("N_HEADS", 4)
-POS_SCALER = config.get("Pos_SCALER", 2.0)
+TIME_GUIDANCE_SCALE = config.get("T_SCALER", config.get("T_SCALER_END", 0.001))
+POS_SCALER = config.get("Pos_SCALER", config.get("POS_SCALER_END", 2.0))
+
+print(TIME_GUIDANCE_SCALE)
+print(POS_SCALER)
 TEMPERATURE_METHOD = 'cosine'
 
 
@@ -121,7 +125,7 @@ def run_ai_solver(model, problem_file, workpieces_objs, machine_power_data, devi
     # 4. 转换并模拟
     try:
         wp_cycles = graph_to_simulation_input(edges_matrix, ipps_canvas, workpieces_objs, priorities)
-        _, energy_report, _ = simulate_complete_scheduling(wp_cycles, machine_power_data)
+        _, energy_report, _ = simulate_complete_scheduling(wp_cycles, machine_power_data, time_uncertainty = UNCERTAINTY_LEVEL)
         return energy_report['total']['makespan'], energy_report['total']['total_energy']
     except Exception as e:
         print(f"Sim Error: {e}")
@@ -180,7 +184,7 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
     edges_batch, _, _, priorities_batch = model.reverse_diffusion_with_logprob(
         ipps_canvas, device, num_samples=pop_size,
         time_guidance_scale=TIME_GUIDANCE_SCALE, position_guidance_scale=POS_SCALER,
-        temperature_method=TEMPERATURE_METHOD
+        temperature_method=TEMPERATURE_METHOD, greedy=True
     )
 
     best_solution = {"makespan": float('inf'), "energy": float('inf')}
@@ -197,7 +201,7 @@ def run_evolutionary_solver(model, problem_file, workpieces_objs, machine_power_
             # 验证有效性
             if validate_constraints(e_indices_cpu[i], node_labels, device, exact=True, data=ipps_canvas):
                 wp_cycles = graph_to_simulation_input(e_indices_cpu[i], ipps_canvas, workpieces_objs, prio_cpu[i])
-                _, rep, completed_ops = simulate_complete_scheduling(wp_cycles, machine_power_data)
+                _, rep, completed_ops = simulate_complete_scheduling(wp_cycles, machine_power_data, time_uncertainty = UNCERTAINTY_LEVEL)
                 mk = rep['total']['makespan']
                 eng = rep['total']['total_energy']
             else:
@@ -373,11 +377,11 @@ def main():
     csv_data_model = []
 
     results = []
-    gantt_dir = Path("Gantt_Charts_Diffusion")
+    gantt_dir = Path("Gantt_Charts_Diffusion_stochastic")
     gantt_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"🔄 Loading model from {MODEL_PATH}...")
-    model = LightweightIndustrialDiffusion(T=T_STEPS, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, nhead=N_HEADS, dropout=0.1, device=DEVICE).to(
+    model = LightweightIndustrialDiffusion(T=T_STEPS, input_dim=7, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, nhead=N_HEADS, dropout=0.1, device=DEVICE).to(
         DEVICE)
 
     try:
@@ -502,7 +506,7 @@ def main():
     print(f"\n💾 Saving CSV files...")
     if need_random:
         save_to_csv(csv_data_random, f"result_random.csv")
-    save_to_csv(csv_data_model, f"result_model_{model_weight_path}_evo100_Pguidance5_passPriority_cross.csv")
+    save_to_csv(csv_data_model, f"result_model_{model_weight_path}_evo1_passPriority_cross.csv")
 
     plot_results(results)
 

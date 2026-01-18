@@ -25,24 +25,29 @@ random.seed(SEED)
 TRAIN_DIR = "Problem_TrainSet"
 VAL_DIR = "Problem_ValidationSet"
 # PROBLEM_FILE = "Problem_TrainSet/1.json"
-RUN_NAME = "rl_new1219_HiddenD256"
+RUN_NAME = "rl_new0110_decay_scaler_introduce_advantage"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 LR = 2e-5   #learning rate
 EPOCHS = 1000
 BATCH_SIZE = 32
-T_STEPS = 4
+T_STEPS = 8
 # ENTROPY_START = 0.005
 # ENTROPY_END = 0.0001
 # DECAY_STEPS = 500
 ENTROPY_START = 0.1
 ENTROPY_END = 0.001
 DECAY_STEPS = 500
-T_SCALER = 0.001
-POS_SCALER = 2.0
-VALIDATE_STEP = 1  #validate the model every {VALIDATE_STEP} steps
+# T_SCALER = 0.01
+# POS_SCALER = 2.0
+POS_SCALER_START = 2.0
+POS_SCALER_END = 0.2
+T_SCALER_START = 0.02  # 初始给强一点的引导，快速冷启动
+T_SCALER_END = 0.001
+
+VALIDATE_STEP = 5  #validate the model every {VALIDATE_STEP} steps
 VALIDATE_BS = 4     #how many samples are generated when validating the model, then choose the best one
-HIDDEN_DIMENSION = 256
+HIDDEN_DIMENSION = 128
 NUM_LAYERS = 6
 N_HEADS = 4
 TEMPERATURE_METHOD = 'cosine'
@@ -116,8 +121,12 @@ config = {
     "ENTROPY_START": ENTROPY_START,
     "ENTROPY_END": ENTROPY_END,
     "DECAY_STEPS": DECAY_STEPS,
-    "T_SCALER": T_SCALER,
-    "Pos_SCALER": POS_SCALER,
+    # "T_SCALER": T_SCALER,
+    # "Pos_SCALER": POS_SCALER,
+    "POS_SCALER_START":POS_SCALER_START,
+    "POS_SCALER_END":POS_SCALER_END,
+    "T_SCALER_START":T_SCALER_START,
+    "T_SCALER_END":T_SCALER_END,
     "VALIDATE_STEP": VALIDATE_STEP,
     "VALIDATE_BS": VALIDATE_BS,
     "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
@@ -146,7 +155,9 @@ for epoch in range(EPOCHS):
 
     progress = min(1.0, epoch / DECAY_STEPS)
     current_entropy_coef = ENTROPY_START - (ENTROPY_START - ENTROPY_END) * progress
-
+    current_t_scaler = T_SCALER_START - (T_SCALER_START - T_SCALER_END) * progress
+    current_pos_scaler = POS_SCALER_START - (POS_SCALER_START - POS_SCALER_END) * progress
+    
     random.shuffle(train_set)
 
     if len(train_set) > PROBLEMS_PER_EPOCH:
@@ -173,8 +184,8 @@ for epoch in range(EPOCHS):
             single_canvas,
             DEVICE,
             num_samples=BATCH_SIZE,
-            time_guidance_scale=T_SCALER,
-            position_guidance_scale=POS_SCALER,
+            time_guidance_scale=current_t_scaler,
+            position_guidance_scale=current_pos_scaler,
             temperature_method=TEMPERATURE_METHOD,
         )
 
@@ -308,8 +319,8 @@ for epoch in range(EPOCHS):
                     v_prob['canvas'],
                     DEVICE,
                     num_samples=VALIDATE_BS,
-                    time_guidance_scale=T_SCALER,
-                    position_guidance_scale=POS_SCALER,
+                    time_guidance_scale=current_t_scaler,
+                    position_guidance_scale=current_pos_scaler,
                     temperature_method=TEMPERATURE_METHOD,
                 )
 
