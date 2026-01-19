@@ -5,10 +5,29 @@ import re
 
 # 假设您的四个文件名为 file1.csv, file2.csv, file3.csv, file4.csv
 # 在实际使用时，请修改为您真实的文件名
-file_names = ['results_GA.csv', 'results_RL.csv', 'result_model_rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance.csv', 'result_random.csv']
+file_names = ['results_GA.csv', 'results_RL.csv',
+              'result_model_rl_adding_temperature_BS32_T16_Layer6_HIDDEN_DIMENSION256.csv',
+              'result_model_rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance.csv',
+              'result_model_rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance_evo3.csv',
+              'result_model_rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance_evo10.csv',
+              'result_model_rl_adding_temperature_BS32_T4_Layer6_HIDDEN_DIMENSION128_Trainset20_P_Guidance_evo60_Pguidance5.csv',
+              'result_model_rl_new1219_2_evo_Pguidance5.csv',
+              # 'result_model_rl_new1219_2_evo_Pguidance5_passPriority.csv',
+              # 'result_model_rl_new1219_2_evo_Pguidance5_passPriority_step2.csv',
+              # 'result_model_rl_new1219_2_evo20_Pguidance5_passPriority.csv',
+              # 'result_model_rl_new1219_2_evo_Pguidance5_passPriority_step4.csv',
+              # 'result_model_rl_new1219_2_evo100_Pguidance5_passPriority.csv',
+              'result_random.csv']
 data_frames = []
-legend_name = ['GA', 'RL', 'Diffusion', 'Random']
-
+legend_name = ['GA', 'RL', 'Diffusion without P Guidance', 'Diffusion', 'Diffusion with EVO3', 'Diffusion with EVO10',
+               'Diffusion with EVO10_sample60','Diffusion_correct with EVO10_sample40',
+               # 'Diffusion_correct_pass_Priority with EVO10_sample40',
+               # 'Diffusion_correct_pass_Priority with EVO10_sample40_mutationStep2',
+               # 'Diffusion_correct_pass_Priority with EVO20_sample40_mutationStep1',
+               # 'Diffusion_correct_pass_Priority with EVO20_sample40_mutationStep4',
+               # 'Diffusion_correct_pass_Priority with EVO100_sample40_mutationStep4',
+               'Random']
+figname = 'grouped_bar_chart_8.png'
 # 定义提取Job数量的函数
 def extract_job_count(filename):
     # 正则表达式：匹配 gen_ 和 _job 之间的数字
@@ -61,5 +80,5 @@ if data_frames:
     plt.legend(title='File Source')
 
     # 保存或显示
-    plt.savefig('grouped_bar_chart.png')
+    plt.savefig(figname)
     plt.show()

@@ -3,7 +3,7 @@
 # 1 Industrial Dataset Creation
 from tqdm import tqdm
 import ast
-
+import glob
 import pandas as pd
 from torch_geometric.data import InMemoryDataset, Data
 import json
@@ -472,6 +472,18 @@ class ResGNNBlock(nn.Module):
         return x
 
 
+class SimpleEdgeEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, output_dim * 2), # 先升维
+            nn.SiLU(),                            # 非线性激活
+            nn.Linear(output_dim * 2, output_dim),# 再降维
+            nn.LayerNorm(output_dim)              # 归一化 (很重要!)
+        )
+    def forward(self, x):
+        return self.net(x)
+
 # ----------------------------------------------------------------
 # 3. 主模型：ComplexIndustrialDiffusion
 # ----------------------------------------------------------------
@@ -484,13 +496,29 @@ class LightweightIndustrialDiffusion(nn.Module):
         self.T = T
         self.hidden_dim = hidden_dim
 
-        self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        # self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        # self.alpha = 1 - self.beta_schedule
+        # self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+        def cosine_schedule(t, T, s=0.008):
+            steps = t + 1
+            x = torch.linspace(0, T, steps)
+            # 对应你的 PDF 公式 ，但增加了 s 以保证数值稳定
+            alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi * 0.5) ** 2
+            return alphas_cumprod / alphas_cumprod[0]
+
+        alphas_cumprod = cosine_schedule(T, T).to(self.device)  # how much to reserve, t=0, alpha = 1
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])  # how much to noise, t=0, alpha = 0
+        # 截断 beta 防止数值爆炸 (通常限制在 0.999)
+        self.beta_schedule = torch.clamp(betas, 0, 0.999)
         self.alpha = 1 - self.beta_schedule
-        self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+        # 注意：这里直接使用我们算好的 Cosine alpha_bar，而不是用 beta 累乘
+        # 这样能保证精度，且符合 PDF 中的公式要求
+        self.register_buffer('alpha_bar', alphas_cumprod[1:])
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.edge_encoder = nn.Linear(3, edge_dim)  # edge_attr 是时间和priority
+
+        self.edge_encoder = SimpleEdgeEncoder(3, edge_dim)  # edge_attr 是时间,advantage和priority
 
         # Time Embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
@@ -524,7 +552,7 @@ class LightweightIndustrialDiffusion(nn.Module):
     def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None, advantage_matrix=None):
 
         h = self.node_encoder(x.float())
-
+        print(advantage_matrix)
         # Time Embedding
         if isinstance(t, torch.Tensor):
             t_tensor = t.to(x.device).float()
@@ -609,7 +637,7 @@ class LightweightIndustrialDiffusion(nn.Module):
                 num_nodes_per_graph = advantage_matrix.size(0)
                 edge_advs = advantage_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
         else:
-            print('no advantage matrix') # 训练时不想一直打印，可以注释掉
+            print('no advantage matrix')
             edge_advs = torch.zeros_like(edge_times)
             
         if priorities is not None:
@@ -759,7 +787,7 @@ class LightweightIndustrialDiffusion(nn.Module):
         seq_edges_src = data.edge_index[0]
         seq_edges_tgt = data.edge_index[1]
         pinned_mask_single = torch.zeros((num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
-        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True
+        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True     #operation order
         pinned_mask_batch = pinned_mask_single.unsqueeze(0).expand(B, -1, -1)
 
         op_indices = (node_types == 0).nonzero(as_tuple=True)[0]

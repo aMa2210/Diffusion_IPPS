@@ -412,9 +412,27 @@ class LightweightIndustrialDiffusion(nn.Module):
         self.T = T
         self.hidden_dim = hidden_dim
 
-        self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        def cosine_schedule(t, T, s=0.008):
+            steps = t + 1
+            x = torch.linspace(0, T, steps)
+            # 对应你的 PDF 公式 ，但增加了 s 以保证数值稳定
+            alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi * 0.5) ** 2
+            return alphas_cumprod / alphas_cumprod[0]
+
+        alphas_cumprod = cosine_schedule(T, T).to(self.device)  # how much to reserve, t=0, alpha = 1
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])  # how much to noise, t=0, alpha = 0
+        # 截断 beta 防止数值爆炸 (通常限制在 0.999)
+        self.beta_schedule = torch.clamp(betas, 0, 0.999)
+
+        # 4. 重新注册 buffer (兼容你原有的前向传播代码)
         self.alpha = 1 - self.beta_schedule
-        self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+        # 注意：这里直接使用我们算好的 Cosine alpha_bar，而不是用 beta 累乘
+        # 这样能保证精度，且符合 PDF 中的公式要求
+        self.register_buffer('alpha_bar', alphas_cumprod[1:])
+
+        # self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        # self.alpha = 1 - self.beta_schedule
+        # self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
