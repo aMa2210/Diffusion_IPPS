@@ -477,7 +477,7 @@ if __name__ == "__main__":
             ga = SingleObjectiveGA(jobs_data, machine_ids, pop_size=100, max_gen=500)
             best_ind = ga.run()
             det_makespan = best_ind.makespan
-            stochastic_mk, ops_list_for_training = evaluate_stochastic_with_log(
+            stochastic_mk, ops_list = evaluate_stochastic_with_log(
                 best_ind, 
                 jobs_data, 
                 machine_ids, 
@@ -507,7 +507,7 @@ if __name__ == "__main__":
             # results.append([filename, best_makespan])
             # print(f"[{i + 1}/{len(files)}] 完成: {filename} -> Makespan: {best_makespan}")
             converter = GA_to_Diffusion_Converter(jobs_data, machine_ids)
-            edge_index, priorities = converter.convert(best_ind, ops_list_for_training)
+            edge_index, priorities = converter.convert(best_ind, ops_list)
             
             # 构造一个 Data 对象 (或者字典)
             data_sample = {

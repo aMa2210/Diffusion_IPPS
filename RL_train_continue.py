@@ -8,7 +8,7 @@ import os
 import random
 import json
 
-from Industrial_Pipeline_Functions import (
+from Industrial_Pipeline_Functions_Copy1 import (
     LightweightIndustrialDiffusion,
     load_ipps_problem_from_json,
     get_ipps_problem_data,
@@ -21,7 +21,7 @@ from Evaluate import (
 )
 
 # --- 修改建议示例 ---
-RUN_NAME = "rl_new0110_decay_scaler(TScaler0.01)_introduce_advantage_resume_from_ep999"  # 1. 改名
+RUN_NAME = "rl_new0110_decay_scaler(TScaler0.01)_introduce_advantage_resume_from_ep999_tmp"  # 1. 改名
 LR = 5e-6  
 
 # 3. 将起始值设为上一轮的结束值 (保持低熵、低Guidance强度的稳定状态)

@@ -27,6 +27,72 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OPERATION, MACHINE = 0, 1
 
 
+
+class SupervisedDataset(torch.utils.data.Dataset):
+    def __init__(self, problem_dir, expert_data_path):
+        self.problem_dir = problem_dir
+        self.expert_data = torch.load(expert_data_path)
+        self.expert_map = {item['problem_file']: item for item in self.expert_data}
+        
+        # 获取所有有专家解的 JSON 文件列表
+        self.file_list = []
+        all_files = glob.glob(os.path.join(problem_dir, "*.json"))
+        for f in all_files:
+            fname = os.path.basename(f)
+            if fname in self.expert_map:
+                self.file_list.append(f)
+            else:
+                print(f"Warning: No expert solution found for {fname}, skipping.")
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        filepath = self.file_list[idx]
+        filename = os.path.basename(filepath)
+        
+        # 1. 加载原始问题图 (Inputs)
+        # 这里复用你现有的加载函数
+        raw_wp_dicts, raw_machines = load_ipps_problem_from_json(filepath)
+        data = get_ipps_problem_data(raw_wp_dicts, raw_machines, device='cpu') # 先在CPU处理
+        
+        # 2. 加载专家解 (Labels)
+        expert_sample = self.expert_map[filename]
+        
+        # --- 处理边 (Routing Labels) ---
+        # expert_edges 是 [2, N_ops] 的 tensor, source 是 op_node, target 是 machine_node
+        # 我们需要构建一个完整的 Edge Label 矩阵 (或者让模型预测时的 target)
+        # 在你的模型中，边是稠密的 [N, N]，我们需要构建 Ground Truth 的边矩阵
+        
+        num_nodes = data.x.size(0)
+        # 初始化 GT 边: 0 表示无边, 1 表示有边 (根据你的 edge_num_classes=2)
+        # 注意：你的模型输出是 One-Hot, 这里我们准备 Long Tensor 用于 CrossEntropy
+        gt_edge_indices = torch.zeros((num_nodes, num_nodes), dtype=torch.long)
+        
+        # 填充 Expert Edges (Op -> Machine)
+        exp_src, exp_dst = expert_sample['expert_edges']
+        gt_edge_indices[exp_src, exp_dst] = 1 # Class 1 = Connected
+        
+        # 填充 Pinned Edges (Op -> Op, 工艺约束) - 这些也是 Ground Truth 的一部分
+        seq_src, seq_dst = data.edge_index
+        gt_edge_indices[seq_src, seq_dst] = 1 
+        
+        # --- 处理优先级 (Sequencing Labels) ---
+        # expert_priorities 是 [N_ops]
+        gt_priorities = torch.zeros(num_nodes, dtype=torch.float)
+        # 只需要填充 Op 节点的部分 (前 N_ops 个节点)
+        num_ops = expert_sample['expert_priorities'].size(0)
+        gt_priorities[:num_ops] = expert_sample['expert_priorities']
+        
+        # 返回一个字典或 Data 对象
+        return {
+            'data': data,                   # PyG Data 对象 (x, edge_index, etc.)
+            'gt_edges': gt_edge_indices,    # [N, N] Long Tensor
+            'gt_priorities': gt_priorities, # [N] Float Tensor
+            'filename': filename
+        }
+
+
 def load_ipps_problem_from_json(filepath):
     with open(filepath, 'r') as f:
         problem_def = json.load(f)
@@ -149,8 +215,19 @@ def get_ipps_problem_data(problem_workpieces, problem_machines, device):
     # 注意：只针对 sub_matrix > 0 的部分计算
     advantage_sub_matrix = torch.zeros_like(sub_matrix)
     mask = sub_matrix > 0
-    # 相对偏差： (Time - Min) / Min
-    advantage_sub_matrix[mask] = (sub_matrix[mask] - min_time_expanded[mask]) / (min_time_expanded[mask] + 1e-6)
+    denominator = min_time_expanded[mask] + 1e-5 
+    
+    # 2. 计算原始值
+    raw_adv = (sub_matrix[mask] - min_time_expanded[mask]) / denominator
+    
+    # 3. 【关键】截断 (Clamp) 数值，防止出现极大值 (例如 > 100) 破坏梯度
+    # 通常 advantage 不会太大，限制在 0~10 之间是安全的
+    raw_adv = torch.clamp(raw_adv, min=0.0, max=10.0)
+    
+    advantage_sub_matrix[mask] = raw_adv
+    
+    # # 相对偏差： (Time - Min) / Min
+    # advantage_sub_matrix[mask] = (sub_matrix[mask] - min_time_expanded[mask]) / (min_time_expanded[mask] + 1e-6)
     
     # 放入完整的 advantage_matrix
     advantage_matrix = torch.zeros((num_nodes, num_nodes), device=device)
@@ -366,6 +443,9 @@ class ResGNNBlock(nn.Module):
             nn.Linear(hidden_dim, 4 * hidden_dim)
         )
 
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        
     def forward(self, x, t_emb, edge_index, edge_attr):
         # 1. 计算 AdaLN 参数
         scale_shift = self.adaLN_modulation(t_emb)  # [Batch, 4*Dim] -> 需要扩展到 [Num_Nodes, 4*Dim]
@@ -373,7 +453,10 @@ class ResGNNBlock(nn.Module):
         # 处理 Batch 维度对齐问题 (Graph Batching 中 x 是堆叠的)
         # 假设 t_emb 已经根据 batch 扩展好了 或者在这里进行 gather
         # 简单起见，假设传入 forward 的 t_emb 已经是 [Num_Nodes, Dim]
-
+        if scale_shift.shape[1] == 1:
+            print(f"CRITICAL ERROR: scale_shift shape is {scale_shift.shape}")
+            print(f"Layer config: {self.adaLN_modulation}")
+            
         shift_msa, scale_msa, shift_mlp, scale_mlp = scale_shift.chunk(4, dim=1)
 
         # 2. Attention Block (Pre-Norm + Residual)
@@ -443,27 +526,90 @@ class LightweightIndustrialDiffusion(nn.Module):
         h = self.node_encoder(x.float())
 
         # Time Embedding
-        t_tensor = torch.tensor([t], dtype=torch.float, device=x.device)
-        t_emb = self.time_embedder(t_tensor)  # [1, Hidden]
+        if isinstance(t, torch.Tensor):
+            t_tensor = t.to(x.device).float()
+            # 训练时 t 是 [Batch]，RL时 t 可能被包装过
+            # 必须使用 reshape(-1) 确保它是扁平的 1D 向量 [B]
+            # 之前的 unsqueeze(-1) 导致了 [B, 1] -> [B, 1, Hidden] 的维度灾难
+            t_tensor = t_tensor.reshape(-1)
+        else:
+            # 推理模式：t 是 python int/float
+            # t_tensor = torch.tensor([t], dtype=torch.float, device=x.device).view(1, 1)
+            t_tensor = torch.tensor([t], dtype=torch.float, device=x.device).view(1)
+            
+        t_emb = self.time_embedder(t_tensor)
         # 将 t_emb 扩展到每个节点: [Num_Nodes, Hidden]
-        t_emb_node = t_emb.repeat(h.size(0), 1)
+        if t_emb.size(0) == 1 and batch is None:
+            # 单图推理且没有 batch 索引时
+            t_emb_node = t_emb.repeat(h.size(0), 1)
+        elif t_emb.size(0) > 1:
+            # Batch 训练模式: 利用 batch 索引将对应的 t_emb 映射给每个节点
+            # t_emb: [Batch_Size, Hidden]
+            # batch: [Total_Nodes]
+            # 结果: [Total_Nodes, Hidden]
+            t_emb_node = t_emb[batch]
+        else:
+            # 单图推理但有 batch 向量 (batch 全是 0)
+            t_emb_node = t_emb.repeat(h.size(0), 1)
         src, dst = edge_index
         
-        # Edge Attributes 处理
-        if time_matrix is not None:
-            if time_matrix.size(0) < x.size(0):
-                num_nodes_per_graph = time_matrix.size(0)
-                edge_times = time_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
-            else:
-                edge_times = time_matrix[src, dst].unsqueeze(-1)
-                # === [Batch Patch End] ===
+        if time_matrix.dim() == 3:
+            # 【训练模式】 time_matrix 是 [Batch_Size, Max_N, Max_N]
+            # 我们需要根据 batch 索引，计算出每个节点在各自图中的“局部索引”来查表
+            
+            # 1. 获取每条边属于哪个 Batch
+            edge_batch = batch[src] # [E]
+            
+            # 2. 计算每个 Batch 的节点偏移量 (Ptr)
+            # 假设 batch 是标准 PyG 格式 (0,0,..,1,1,..)，我们可以统计每个图的节点数
+            batch_size = time_matrix.size(0)
+            node_counts = torch.bincount(batch, minlength=batch_size)
+            # 计算偏移量: [0, N1, N1+N2, ...]
+            ptr = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long), 
+                             torch.cumsum(node_counts, dim=0)[:-1]])
+            
+            # 3. 计算局部索引 (Global Index - Offset)
+            edge_offsets = ptr[edge_batch]
+            local_src = src - edge_offsets
+            local_dst = dst - edge_offsets
+            
+            # 4. 从 3D 矩阵中提取值 [Batch, Local_Src, Local_Dst]
+            # 结果: [E, 1]
+            edge_times = time_matrix[edge_batch, local_src, local_dst].unsqueeze(-1)
+        
         else:
-            print('no time metrix!!!')
-            edge_times = torch.zeros((edge_index.size(1), 1), device=x.device)
+            # 【推理模式】 time_matrix 是 [N, N]
+            # 直接查表即可
+            if time_matrix.size(0) < x.size(0):
+                 num_nodes_per_graph = time_matrix.size(0)
+                 # 使用取模 (%) 将全局索引映射回局部索引
+                 edge_times = time_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
+            else:
+                 edge_times = time_matrix[src, dst].unsqueeze(-1)
+            # edge_times = time_matrix[src, dst].view(-1, 1)
 
         if advantage_matrix is not None:
-            edge_advs = advantage_matrix[src, dst].unsqueeze(-1)
+            if advantage_matrix.dim() == 3: # [Batch, N, N]
+                # 复用上面计算好的索引
+                # 注意：如果 time_matrix 为 None，上面的索引可能没计算，这里需要重新判断
+                # 但通常它们是一起出现的。为了安全，这里假设上面 time_matrix 存在
+                # 或者你可以把计算 local_src 的逻辑提出来复用
+                if 'edge_batch' not in locals():
+                    edge_batch = batch[src]
+                    batch_size = advantage_matrix.size(0)
+                    node_counts = torch.bincount(batch, minlength=batch_size)
+                    ptr = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long), 
+                                     torch.cumsum(node_counts, dim=0)[:-1]])
+                    edge_offsets = ptr[edge_batch]
+                    local_src = src - edge_offsets
+                    local_dst = dst - edge_offsets
+                
+                edge_advs = advantage_matrix[edge_batch, local_src, local_dst].unsqueeze(-1)
+            else: # [N, N]
+                num_nodes_per_graph = advantage_matrix.size(0)
+                edge_advs = advantage_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
         else:
+            print('no advantage matrix') # 训练时不想一直打印，可以注释掉
             edge_advs = torch.zeros_like(edge_times)
             
         if priorities is not None:
@@ -648,7 +794,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             global_u = u + b_idx * num_nodes_per_graph
             global_v = v + b_idx * num_nodes_per_graph
             edge_index_t = torch.stack([global_u, global_v], dim=0)
-            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix, priorities=current_priorities)
+            edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix, priorities=current_priorities,advantage_matrix=data.advantage_matrix)
 ##########################################
             if edge_outputs_list:
                 # edge_output = edge_outputs_list[0]  # [B, N, N, 4]
@@ -817,7 +963,7 @@ class LightweightIndustrialDiffusion(nn.Module):
             edge_index_t = torch.stack([global_u, global_v], dim=0)
             # edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, t, data.time_matrix)
             edge_outputs_list = self.forward(batch_data.x, edge_index_t, batch_data.batch, 
-                                             t, data.time_matrix, priorities=current_priorities)
+                                             t, data.time_matrix, priorities=current_priorities,advantage_matrix=data.advantage_matrix)
             if edge_outputs_list:
                 edge_output = torch.stack(edge_outputs_list, dim=0)
 
