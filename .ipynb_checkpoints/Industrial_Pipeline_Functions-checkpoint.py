@@ -3,7 +3,7 @@
 # 1 Industrial Dataset Creation
 from tqdm import tqdm
 import ast
-
+import glob
 import pandas as pd
 from torch_geometric.data import InMemoryDataset, Data
 import json
@@ -103,7 +103,7 @@ def load_ipps_problem_from_json(filepath):
 
     machines = [int(m) for m in problem_def.get("machines", [])]
 
-    print(f"✅ Loaded task from {filepath} with {len(workpieces)} workpieces {len(machines)} machines")
+    # print(f"✅ Loaded task from {filepath} with {len(workpieces)} workpieces {len(machines)} machines")
     return workpieces, machines
 
 
@@ -472,6 +472,18 @@ class ResGNNBlock(nn.Module):
         return x
 
 
+class SimpleEdgeEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, output_dim * 2), # 先升维
+            nn.SiLU(),                            # 非线性激活
+            nn.Linear(output_dim * 2, output_dim),# 再降维
+            nn.LayerNorm(output_dim)              # 归一化 (很重要!)
+        )
+    def forward(self, x):
+        return self.net(x)
+
 # ----------------------------------------------------------------
 # 3. 主模型：ComplexIndustrialDiffusion
 # ----------------------------------------------------------------
@@ -484,13 +496,29 @@ class LightweightIndustrialDiffusion(nn.Module):
         self.T = T
         self.hidden_dim = hidden_dim
 
-        self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        # self.beta_schedule = torch.linspace(beta_start, beta_end, T)
+        # self.alpha = 1 - self.beta_schedule
+        # self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+        def cosine_schedule(t, T, s=0.008):
+            steps = t + 1
+            x = torch.linspace(0, T, steps)
+            # 对应你的 PDF 公式 ，但增加了 s 以保证数值稳定
+            alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi * 0.5) ** 2
+            return alphas_cumprod / alphas_cumprod[0]
+
+        alphas_cumprod = cosine_schedule(T, T).to(self.device)  # how much to reserve, t=0, alpha = 1
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])  # how much to noise, t=0, alpha = 0
+        # 截断 beta 防止数值爆炸 (通常限制在 0.999)
+        self.beta_schedule = torch.clamp(betas, 0, 0.999)
         self.alpha = 1 - self.beta_schedule
-        self.register_buffer('alpha_bar', torch.cumprod(self.alpha, dim=0))
+        # 注意：这里直接使用我们算好的 Cosine alpha_bar，而不是用 beta 累乘
+        # 这样能保证精度，且符合 PDF 中的公式要求
+        self.register_buffer('alpha_bar', alphas_cumprod[1:])
 
         # Input Projection
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.edge_encoder = nn.Linear(3, edge_dim)  # edge_attr 是时间和priority
+
+        self.edge_encoder = SimpleEdgeEncoder(3, edge_dim)  # edge_attr 是时间,advantage和priority
 
         # Time Embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
@@ -524,7 +552,10 @@ class LightweightIndustrialDiffusion(nn.Module):
     def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None, advantage_matrix=None):
 
         h = self.node_encoder(x.float())
-
+        # print(advantage_matrix)
+        # non_zeros = advantage_matrix[advantage_matrix != 0]
+        # print(f"非零元素个数: {non_zeros.numel()}")
+        # print(f"非零元素值: {non_zeros}")
         # Time Embedding
         if isinstance(t, torch.Tensor):
             t_tensor = t.to(x.device).float()
@@ -609,7 +640,7 @@ class LightweightIndustrialDiffusion(nn.Module):
                 num_nodes_per_graph = advantage_matrix.size(0)
                 edge_advs = advantage_matrix[src % num_nodes_per_graph, dst % num_nodes_per_graph].unsqueeze(-1)
         else:
-            print('no advantage matrix') # 训练时不想一直打印，可以注释掉
+            print('no advantage matrix')
             edge_advs = torch.zeros_like(edge_times)
             
         if priorities is not None:
@@ -759,13 +790,27 @@ class LightweightIndustrialDiffusion(nn.Module):
         seq_edges_src = data.edge_index[0]
         seq_edges_tgt = data.edge_index[1]
         pinned_mask_single = torch.zeros((num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
-        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True
+        pinned_mask_single[seq_edges_src, seq_edges_tgt] = True     #operation order
         pinned_mask_batch = pinned_mask_single.unsqueeze(0).expand(B, -1, -1)
 
         op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
         machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
         e = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph, self.edge_num_classes), device=device)
+        rand_logits = torch.rand_like(allowed_mask_batch.float())
+        rand_logits[~allowed_mask_batch] = -1e9
+        random_target_idx = rand_logits.argmax(dim=2)
+
+                                           
         e[:, :, :, 0] = 1  # Default NoEdge
+        target_mask = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
+        target_mask.scatter_(2, random_target_idx.unsqueeze(2), True)
+        has_valid_options = allowed_mask_batch.sum(dim=2) > 0
+        final_init_mask = target_mask & has_valid_options.unsqueeze(2)
+        
+        # 将选中的位置设为 Class 1 (Connected), Class 0 (No Edge) 设为 0
+        e[final_init_mask] = torch.tensor([0.0, 1.0], device=device)
+        e[~final_init_mask] = torch.tensor([1.0, 0.0], device=device) # 其他地方保持 No Edge
+                                           
         e[pinned_mask_batch] = torch.tensor([0.0, 1.0], device=device)
 
         total_log_prob = torch.zeros(B, device=device)
@@ -804,8 +849,10 @@ class LightweightIndustrialDiffusion(nn.Module):
                 if position_guidance_scale > 0:
                     prio_mean = prio_mean + pos_bias_tensor
                 
-                prio_log_std = edge_output[:, :, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                # prio_log_std = edge_output[:, :, :, 3]
+                
+                # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_std = current_temp
                 scaled_prio_std = prio_std * current_temp + 1e-6
 
                 prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
@@ -971,8 +1018,10 @@ class LightweightIndustrialDiffusion(nn.Module):
                 prio_mean = edge_output[:, :, :, 2]
                 if position_guidance_scale > 0:
                     prio_mean = prio_mean + pos_bias_tensor
-                prio_log_std = edge_output[:, :, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                # prio_log_std = edge_output[:, :, :, 3]
+                # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_std = current_temp
+                
                 scaled_prio_std = prio_std * current_temp + 1e-6
                 prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
                 raw_priority_sample = prio_dist.sample()

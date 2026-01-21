@@ -209,7 +209,7 @@ def apply_constrained_edge_noise(gt_edges, allowed_mask, alpha_bar, device):
 
 if __name__ == "__main__":
     
-    RUN_NAME = "SL_Run_Fix_Batching_119"
+    RUN_NAME = "SL_Run_Fix_Batching_121"
     SPT_checkpoint_dir = 'SPT_checkpoints'
     log_dir = Path(SPT_checkpoint_dir) / RUN_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -254,7 +254,10 @@ if __name__ == "__main__":
         "EPOCHS": EPOCHS,
         "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
         "NUM_LAYERS": NUM_LAYERS,
-        "Description": "Supervised Learning with Correct Padding and Batching"
+        "Description": "Supervised Learning with Correct Padding and Batching",
+        "T_STEPS": T_STEPS,
+        "NUM_LAYERS": NUM_LAYERS,
+        "N_HEADS": N_HEADS
     }
     with open(log_dir / "config.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -273,7 +276,6 @@ if __name__ == "__main__":
         
         pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
         
-        # 【关键】解包 5 个变量
         for batch_data, gt_edges, gt_prio_padded, time_matrix, adv_matrix, padded_allowed_mask in pbar:
             
             batch_data = batch_data.to(DEVICE)
@@ -313,7 +315,7 @@ if __name__ == "__main__":
             ], dim=1)
 
             node_a_bar = a_bar[node_batch_idx]    # [Total_Nodes]
-            print(f'model alpha bar min {model.alpha_bar[-1]}')
+            # print(f'model alpha bar min {model.alpha_bar[-1]}')
             # 3. 将 Padded Priority 展平为 [Total_Nodes] 以匹配 PyG 的 batch 结构
             flat_prio_list = []
             for i in range(bs):
@@ -366,17 +368,26 @@ if __name__ == "__main__":
             # 1. Routing Loss (Cross Entropy)
             pred_logits = pred_output[..., :2] # [B, Max, Max, 2]
 
+            
+            
             if loss_calc_mask.sum() > 0:
                 valid_pred = pred_logits[loss_calc_mask]  # [Total_Valid_Options, 2]
                 valid_gt = gt_edges[loss_calc_mask]  # [Total_Valid_Options]
-
+                num_pos = valid_gt.sum().float()
+                num_total = valid_gt.numel()
+                num_neg = num_total - num_pos
+                pos_weight = num_neg / (num_pos + 1e-6)
+                curr_weight = torch.tensor([1.0, pos_weight], device=DEVICE)
+                
+                
                 loss_link = F.cross_entropy(
                     valid_pred,
                     valid_gt,
                     # weight 可以保留，用于处理正负样本不平衡
-                    weight=torch.tensor([0.1, 1.0], device=DEVICE)
+                    weight=curr_weight
                 )
             else:
+                print('error code 94562')
                 loss_link = torch.tensor(0.0, device=DEVICE)
             
             # 2. Priority Loss (MSE)
@@ -387,9 +398,9 @@ if __name__ == "__main__":
             # 扩展 gt_prio_padded [B, Max] -> [B, Max, 1]
             gt_prio_map = gt_prio_padded.unsqueeze(-1).expand(-1, -1, gt_edges.size(2))
             
-            # 只在 (GT Edge 存在) AND (有效区域) 的地方计算 Prio Loss
-            prio_calc_mask = (gt_edges == 1) & edge_mask
-            
+            # # 只在 (GT Edge 存在) AND (有效区域) 的地方计算 Prio Loss
+            # prio_calc_mask = (gt_edges == 1)
+            prio_calc_mask = loss_calc_mask
             if prio_calc_mask.sum() > 0:
                 loss_prio = F.mse_loss(
                     pred_prio_map[prio_calc_mask], 
@@ -422,4 +433,4 @@ if __name__ == "__main__":
             f.write(f"{epoch},{avg_loss:.5f},{avg_link:.5f},{avg_prio:.5f}\n")
             
         if (epoch+1) % 50 == 0:
-            torch.save(model.state_dict(), f"{SPT_checkpoint_dir}/sl_model_{epoch}.pth")
+            torch.save(model.state_dict(), f"{SPT_checkpoint_dir}/{RUN_NAME}/sl_model_{epoch}.pth")

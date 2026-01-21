@@ -1,0 +1,9 @@
+{
+    "RUN_NAME": "SL_Run_Fix_Batching_119_tmp",
+    "BATCH_SIZE": 16,
+    "LR": 0.0001,
+    "EPOCHS": 2000,
+    "HIDDEN_DIMENSION": 128,
+    "NUM_LAYERS": 6,
+    "Description": "Supervised Learning with Correct Padding and Batching"
+}

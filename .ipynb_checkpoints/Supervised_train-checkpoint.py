@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 import json
 from pathlib import Path
 from torch.optim.lr_scheduler import CosineAnnealingLR
-# 引入你现有的模块
 from Industrial_Pipeline_Functions import (
     LightweightIndustrialDiffusion,
     load_ipps_problem_from_json,
@@ -40,6 +39,7 @@ class SupervisedDataset(Dataset):
             if fname in self.expert_map:
                 self.file_list.append(f)
             else:
+                print(f'expert result not found for {fname}')
                 pass # 忽略没有专家解的文件
 
         print(f"Found {len(self.file_list)} aligned samples.")
@@ -75,9 +75,9 @@ class SupervisedDataset(Dataset):
         exp_edges = expert_sample['expert_edges']
         gt_edges[exp_edges[0].long(), exp_edges[1].long()] = 1
         
-        # 填充 Pinned Edges (Op -> Op) - 这些也算作 Ground Truth 的一部分
-        seq_src, seq_dst = data.edge_index
-        gt_edges[seq_src, seq_dst] = 1
+        # # 填充 Pinned Edges (Op -> Op) - 这些也算作 Ground Truth 的一部分
+        # seq_src, seq_dst = data.edge_index
+        # gt_edges[seq_src, seq_dst] = 1
         
         # B. GT Priorities [N] (Float Tensor)
         gt_prio = torch.zeros(num_nodes, dtype=torch.float)
@@ -110,6 +110,7 @@ def custom_collate_fn(batch_list):
     padded_gt_prio = torch.zeros((batch_size, max_nodes), dtype=torch.float)
     padded_time_mat = torch.zeros((batch_size, max_nodes, max_nodes), dtype=torch.float)
     padded_adv_mat = torch.zeros((batch_size, max_nodes, max_nodes), dtype=torch.float)
+    padded_allowed_mask = torch.zeros((batch_size, max_nodes, max_nodes), dtype=torch.bool)
 
     clean_data_list = []
 
@@ -120,14 +121,26 @@ def custom_collate_fn(batch_list):
         # --- A. 填充 GT 数据 ---
         padded_gt_edges[i, :num_nodes, :num_nodes] = item['gt_edges']
         padded_gt_prio[i, :num_nodes] = item['gt_priorities']
-        
+        node_labels = data.x.argmax(dim=1)
+        # 获取该图的合法连接掩码 [N, N]
+        # 注意：get_ipps_allowed_mask 需要 device 参数，这里暂时给 'cpu'
+        mask = get_ipps_allowed_mask(node_labels, data, device='cpu')
+        machine_indices = (node_labels == 1)
+        mask[:, ~machine_indices] = False
+
+        padded_allowed_mask[i, :num_nodes, :num_nodes] = mask
+
         # --- B. 提取并填充 Data 中的属性矩阵 ---
         # 必须在这里提取，因为 PyG Batch 无法自动处理 [N, N] 的堆叠
         if hasattr(data, 'time_matrix'):
             padded_time_mat[i, :num_nodes, :num_nodes] = data.time_matrix
+        else:
+            print('error code 21412')
         
         if hasattr(data, 'advantage_matrix') and data.advantage_matrix is not None:
             padded_adv_mat[i, :num_nodes, :num_nodes] = data.advantage_matrix
+        else:
+            print('error code 9872')
 
         # --- C. 构建干净的 Data 对象 ---
         # "白名单策略"：只保留 x 和 edge_index，彻底避免 PyG 报错
@@ -138,7 +151,57 @@ def custom_collate_fn(batch_list):
     # 3. 生成 PyG Batch
     batch = Batch.from_data_list(clean_data_list)
 
-    return batch, padded_gt_edges, padded_gt_prio, padded_time_mat, padded_adv_mat
+    return batch, padded_gt_edges, padded_gt_prio, padded_time_mat, padded_adv_mat, padded_allowed_mask
+
+
+def apply_constrained_edge_noise(gt_edges, allowed_mask, alpha_bar, device):
+    """
+    Args:
+        gt_edges: [B, N, N] 专家解 (0/1)
+        allowed_mask: [B, N, N] 合法连接掩码 (True/False)
+        alpha_bar: [B] 当前时间步的信号保留率
+    Returns:
+        noisy_edges: [B, N, N] 加噪后的边 (0/1)
+    """
+    B, N, _ = gt_edges.shape
+
+    # 1. 扩展 alpha_bar 以匹配形状 [B, 1, 1]
+    alpha_reshape = alpha_bar.view(B, 1, 1)
+
+    # 2. 生成随机选择矩阵 (Random Valid Selection)
+    # 我们需要在 allowed_mask 为 True 的地方均匀采样
+    # 技巧：给 allowed_mask 加随机噪声，然后取 argmax
+
+    # 生成随机噪声，只在 allowed 的位置有值，其他位置为负无穷
+    rand_logits = torch.rand_like(allowed_mask.float())
+    rand_logits[~allowed_mask] = -1e9
+
+    # 对于每个 Op (行)，选一个随机的合法 Machine (列)
+    # [B, N] -> 每一行选中的 machine index
+    # 注意：只有 Op->Machine 的行需要随机选，Machine->Op 或 Machine->Machine 应该是空的
+    # 这里我们假设 allowed_mask 已经处理好了 Op 行的约束
+    random_target_idx = rand_logits.argmax(dim=2)
+
+    # 转回 One-Hot 形式 [B, N, N]
+    random_valid_edges = torch.zeros_like(gt_edges).scatter_(2, random_target_idx.unsqueeze(2), 1)
+
+    # 修正：如果某一行全是 False (比如机器节点行)，argmax 会出错或归零，需要 mask 掉
+    # 只有那些至少有一个合法连接的行，才应该有边
+    has_valid_connection = allowed_mask.sum(dim=2) > 0
+    random_valid_edges[~has_valid_connection] = 0
+
+    # 3. 混合策略 (Mix)
+    # 生成概率 mask: P < alpha_bar 则保留 GT，否则使用随机合法解
+    prob_mask = torch.rand(B, N, N, device=device) < alpha_reshape
+
+    # 组合：Mask 处用 GT，非 Mask 处用 Random Valid
+    noisy_edges = torch.where(prob_mask, gt_edges, random_valid_edges)
+
+    # 确保结构完整性：非 Allowed 的地方强制为 0 (双重保险)
+    noisy_edges = noisy_edges * allowed_mask.long()
+
+    return noisy_edges
+
 
 # ==========================================
 # 3. 完整的训练脚本
@@ -146,7 +209,7 @@ def custom_collate_fn(batch_list):
 
 if __name__ == "__main__":
     
-    RUN_NAME = "SL_Run_Fix_Batching_119"
+    RUN_NAME = "SL_Run_Fix_Batching_121"
     SPT_checkpoint_dir = 'SPT_checkpoints'
     log_dir = Path(SPT_checkpoint_dir) / RUN_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +254,10 @@ if __name__ == "__main__":
         "EPOCHS": EPOCHS,
         "HIDDEN_DIMENSION": HIDDEN_DIMENSION,
         "NUM_LAYERS": NUM_LAYERS,
-        "Description": "Supervised Learning with Correct Padding and Batching"
+        "Description": "Supervised Learning with Correct Padding and Batching",
+        "T_STEPS": T_STEPS,
+        "NUM_LAYERS": NUM_LAYERS,
+        "N_HEADS": N_HEADS
     }
     with open(log_dir / "config.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -210,8 +276,7 @@ if __name__ == "__main__":
         
         pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
         
-        # 【关键】解包 5 个变量
-        for batch_data, gt_edges, gt_prio_padded, time_matrix, adv_matrix in pbar:
+        for batch_data, gt_edges, gt_prio_padded, time_matrix, adv_matrix, padded_allowed_mask in pbar:
             
             batch_data = batch_data.to(DEVICE)
             gt_edges = gt_edges.to(DEVICE)          # [B, Max, Max]
@@ -229,8 +294,28 @@ if __name__ == "__main__":
             # node_batch_idx: [Total_Nodes] -> 0,0,0, 1,1, ...
             node_batch_idx = batch_data.batch
             a_bar = model.alpha_bar[t].to(DEVICE) # [B]
+
+            noisy_edges_dense = apply_constrained_edge_noise(
+                gt_edges,
+                padded_allowed_mask.to(DEVICE),
+                a_bar,
+                DEVICE
+            )
+            batch_noisy_edge_index = []
+            for i in range(bs):
+                num_n = (batch_data.batch == i).sum().item()
+                curr_adj = noisy_edges_dense[i, :num_n, :num_n]
+                curr_indices = curr_adj.nonzero().t()
+                offset = (batch_data.batch < i).sum().item()
+                batch_noisy_edge_index.append(curr_indices + offset)
+            noisy_routing_edge_index = torch.cat(batch_noisy_edge_index, dim=1)
+            final_input_edge_index = torch.cat([
+                noisy_routing_edge_index,
+                batch_data.edge_index
+            ], dim=1)
+
             node_a_bar = a_bar[node_batch_idx]    # [Total_Nodes]
-            
+            # print(f'model alpha bar min {model.alpha_bar[-1]}')
             # 3. 将 Padded Priority 展平为 [Total_Nodes] 以匹配 PyG 的 batch 结构
             flat_prio_list = []
             for i in range(bs):
@@ -251,7 +336,7 @@ if __name__ == "__main__":
             # 我们刚才修复了 forward，现在它可以接受 3D 的 time_matrix 和 adv_matrix
             edge_outputs_list = model(
                 batch_data.x, 
-                batch_data.edge_index, 
+                final_input_edge_index,
                 batch_data.batch, 
                 t, 
                 time_matrix=time_matrix,     # [B, Max, Max] (3D)
@@ -275,22 +360,35 @@ if __name__ == "__main__":
             # D. 计算 Loss
             # -------------------------------------------------------
             # 利用 to_dense_batch 获取 mask，只在有效节点对上计算 Loss
-            _, mask = to_dense_batch(batch_data.x, batch_data.batch) # [B, Max]
-            # 边 Mask [B, Max, Max] -> 有效区域为 True
-            edge_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
-            
+            # _, mask = to_dense_batch(batch_data.x, batch_data.batch) # [B, Max]
+            # # 边 Mask [B, Max, Max] -> 有效区域为 True
+            # edge_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+            loss_calc_mask = padded_allowed_mask.to(DEVICE)
+
             # 1. Routing Loss (Cross Entropy)
             pred_logits = pred_output[..., :2] # [B, Max, Max, 2]
+
             
-            # 只选取有效区域的预测和 GT
-            valid_pred = pred_logits[edge_mask] # [Total_Valid_Pairs, 2]
-            valid_gt = gt_edges[edge_mask]      # [Total_Valid_Pairs]
             
-            loss_link = F.cross_entropy(
-                valid_pred, 
-                valid_gt,
-                weight=torch.tensor([0.1, 1.0], device=DEVICE)
-            )
+            if loss_calc_mask.sum() > 0:
+                valid_pred = pred_logits[loss_calc_mask]  # [Total_Valid_Options, 2]
+                valid_gt = gt_edges[loss_calc_mask]  # [Total_Valid_Options]
+                num_pos = valid_gt.sum().float()
+                num_total = valid_gt.numel()
+                num_neg = num_total - num_pos
+                pos_weight = num_neg / (num_pos + 1e-6)
+                curr_weight = torch.tensor([1.0, pos_weight], device=DEVICE)
+                
+                
+                loss_link = F.cross_entropy(
+                    valid_pred,
+                    valid_gt,
+                    # weight 可以保留，用于处理正负样本不平衡
+                    weight=curr_weight
+                )
+            else:
+                print('error code 94562')
+                loss_link = torch.tensor(0.0, device=DEVICE)
             
             # 2. Priority Loss (MSE)
             pred_prio_map = pred_output[..., 2] # [B, Max, Max]
@@ -300,9 +398,9 @@ if __name__ == "__main__":
             # 扩展 gt_prio_padded [B, Max] -> [B, Max, 1]
             gt_prio_map = gt_prio_padded.unsqueeze(-1).expand(-1, -1, gt_edges.size(2))
             
-            # 只在 (GT Edge 存在) AND (有效区域) 的地方计算 Prio Loss
-            prio_calc_mask = (gt_edges == 1) & edge_mask
-            
+            # # 只在 (GT Edge 存在) AND (有效区域) 的地方计算 Prio Loss
+            # prio_calc_mask = (gt_edges == 1)
+            prio_calc_mask = loss_calc_mask
             if prio_calc_mask.sum() > 0:
                 loss_prio = F.mse_loss(
                     pred_prio_map[prio_calc_mask], 
@@ -335,4 +433,4 @@ if __name__ == "__main__":
             f.write(f"{epoch},{avg_loss:.5f},{avg_link:.5f},{avg_prio:.5f}\n")
             
         if (epoch+1) % 50 == 0:
-            torch.save(model.state_dict(), f"{SPT_checkpoint_dir}/sl_model_{epoch}.pth")
+            torch.save(model.state_dict(), f"{SPT_checkpoint_dir}/{RUN_NAME}/sl_model_{epoch}.pth")

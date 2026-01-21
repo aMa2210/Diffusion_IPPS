@@ -103,7 +103,7 @@ def load_ipps_problem_from_json(filepath):
 
     machines = [int(m) for m in problem_def.get("machines", [])]
 
-    print(f"✅ Loaded task from {filepath} with {len(workpieces)} workpieces {len(machines)} machines")
+    # print(f"✅ Loaded task from {filepath} with {len(workpieces)} workpieces {len(machines)} machines")
     return workpieces, machines
 
 
@@ -552,7 +552,10 @@ class LightweightIndustrialDiffusion(nn.Module):
     def forward(self, x, edge_index, batch, t, time_matrix=None, priorities=None, advantage_matrix=None):
 
         h = self.node_encoder(x.float())
-        print(advantage_matrix)
+        # print(advantage_matrix)
+        # non_zeros = advantage_matrix[advantage_matrix != 0]
+        # print(f"非零元素个数: {non_zeros.numel()}")
+        # print(f"非零元素值: {non_zeros}")
         # Time Embedding
         if isinstance(t, torch.Tensor):
             t_tensor = t.to(x.device).float()
@@ -793,7 +796,21 @@ class LightweightIndustrialDiffusion(nn.Module):
         op_indices = (node_types == 0).nonzero(as_tuple=True)[0]
         machine_indices = (node_types == 1).nonzero(as_tuple=True)[0]
         e = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph, self.edge_num_classes), device=device)
+        rand_logits = torch.rand_like(allowed_mask_batch.float())
+        rand_logits[~allowed_mask_batch] = -1e9
+        random_target_idx = rand_logits.argmax(dim=2)
+
+                                           
         e[:, :, :, 0] = 1  # Default NoEdge
+        target_mask = torch.zeros((B, num_nodes_per_graph, num_nodes_per_graph), dtype=torch.bool, device=device)
+        target_mask.scatter_(2, random_target_idx.unsqueeze(2), True)
+        has_valid_options = allowed_mask_batch.sum(dim=2) > 0
+        final_init_mask = target_mask & has_valid_options.unsqueeze(2)
+        
+        # 将选中的位置设为 Class 1 (Connected), Class 0 (No Edge) 设为 0
+        e[final_init_mask] = torch.tensor([0.0, 1.0], device=device)
+        e[~final_init_mask] = torch.tensor([1.0, 0.0], device=device) # 其他地方保持 No Edge
+                                           
         e[pinned_mask_batch] = torch.tensor([0.0, 1.0], device=device)
 
         total_log_prob = torch.zeros(B, device=device)
@@ -832,8 +849,10 @@ class LightweightIndustrialDiffusion(nn.Module):
                 if position_guidance_scale > 0:
                     prio_mean = prio_mean + pos_bias_tensor
                 
-                prio_log_std = edge_output[:, :, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                # prio_log_std = edge_output[:, :, :, 3]
+                
+                # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_std = current_temp
                 scaled_prio_std = prio_std * current_temp + 1e-6
 
                 prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
@@ -999,8 +1018,10 @@ class LightweightIndustrialDiffusion(nn.Module):
                 prio_mean = edge_output[:, :, :, 2]
                 if position_guidance_scale > 0:
                     prio_mean = prio_mean + pos_bias_tensor
-                prio_log_std = edge_output[:, :, :, 3]
-                prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                # prio_log_std = edge_output[:, :, :, 3]
+                # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                prio_std = current_temp
+                
                 scaled_prio_std = prio_std * current_temp + 1e-6
                 prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
                 raw_priority_sample = prio_dist.sample()
