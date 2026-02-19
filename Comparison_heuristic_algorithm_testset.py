@@ -326,9 +326,9 @@ if __name__ == "__main__":
 
     # folder_path = os.path.join("TestSet", "Generalization_Temp")
     
-    folder_path = 'Problem_TestSet_GA'
-    output_csv = "result_benchmark_GA_summary.csv"
-    history_dir = "GA_Benchmark_History"
+    folder_path = 'Problem_TestSet_GA_large'
+    output_csv = "result_benchmark_testset_large_GA_summary.csv"
+    history_dir = "GA_Benchmark_testset_large_History"
     if not os.path.exists(history_dir):
         os.makedirs(history_dir)
     # 检查文件夹是否存在
@@ -345,7 +345,7 @@ if __name__ == "__main__":
     print("-" * 50)
 
     summary_results = []
-    POP_SIZE = 100
+    POP_SIZE = 20
     MAX_GEN = 500
     total_makespan = 0
     total_time = 0

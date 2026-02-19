@@ -827,8 +827,8 @@ class LightweightIndustrialDiffusion(nn.Module):
         
         pos_bias_raw = (1.0 - norm_pos) * is_op_node
         pos_bias_tensor = pos_bias_raw.unsqueeze(-1) * position_guidance_scale
-        current_priorities = torch.randn(total_nodes, device=device) * 0.5 + 0.5
-        current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
+        current_priorities = torch.randn(total_nodes, device=device)
+        # current_priorities = torch.clamp(current_priorities, 0.0, 1.0)
                                            
         for t in range(self.T - 1, -1, -1):
 
@@ -845,26 +845,57 @@ class LightweightIndustrialDiffusion(nn.Module):
                 # edge_output = edge_outputs_list[0]  # [B, N, N, 4]
                 edge_output = torch.stack(edge_outputs_list, dim=0)
                 # --- Priorities ---
-                prio_mean = edge_output[:, :, :, 2]
+                pred_x0 = edge_output[:, :, :, 2]
                 if position_guidance_scale > 0:
-                    prio_mean = prio_mean + pos_bias_tensor
+                    pred_x0 = pred_x0 + pos_bias_tensor
+                    
+                curr_prio_dense, _ = to_dense_batch(current_priorities, batch_data.batch, max_num_nodes=num_nodes_per_graph)
+                xt = curr_prio_dense.unsqueeze(-1).expand(-1, -1, num_nodes_per_graph)
+                alpha_bar_t = self.alpha_bar[t]
+                alpha_bar_prev = self.alpha_bar[t-1] if t > 0 else torch.tensor(1.0, device=device)
+                alpha_t = alpha_bar_t / alpha_bar_prev 
+                beta_t = 1 - alpha_t
+                coeff_x0 = (torch.sqrt(alpha_bar_prev) * beta_t) / (1 - alpha_bar_t)
+                coeff_xt = (torch.sqrt(alpha_t) * (1 - alpha_bar_prev)) / (1 - alpha_bar_t)
                 
-                # prio_log_std = edge_output[:, :, :, 3]
+                posterior_mean = coeff_x0 * pred_x0 + coeff_xt * xt
                 
-                # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
-                prio_std = current_temp
-                scaled_prio_std = prio_std * current_temp + 1e-6
+                # 方差计算公式:
+                # sigma_t^2 = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_t
+                posterior_var = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_t
+                posterior_log_var = torch.log(torch.clamp(posterior_var, min=1e-20))
+                
+                # 构造分布: N(mu_tilde, sigma_tilde)
+                # 注意: 这里不再使用 heuristic 的 temperature，而是使用由 t 决定的物理方差
+                # 如果你想保留 temperature 调节，可以在 posterior_log_var 上加一个系数，但标准 DDPM 不需要
+                posterior_std = torch.exp(0.5 * posterior_log_var)
+                prio_dist = torch.distributions.Normal(posterior_mean, posterior_std)
 
-                prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
+
+
+
+                
+                # # prio_log_std = edge_output[:, :, :, 3]
+                
+                # # prio_std = torch.exp(torch.clamp(prio_log_std, min=-20, max=2))
+                # prio_std = current_temp
+                # scaled_prio_std = prio_std * current_temp + 1e-6
+
+                # prio_dist = torch.distributions.Normal(prio_mean, scaled_prio_std)
                 if greedy:
-                    # Greedy模式：直接使用均值 (正态分布的均值即众数/概率最大处)
-                    raw_priority_sample = prio_mean
+                    # Greedy: 直接取均值
+                    raw_priority_sample = posterior_mean
                 else:
-                    # Stochastic模式：从分布采样
-                    raw_priority_sample = prio_dist.sample()
+                    # Stochastic: 从后验分布采样
+                    if t > 0:
+                        raw_priority_sample = prio_dist.sample()
+                    else:
+                        # 最后一步通常不加噪，或者加极小噪声
+                        raw_priority_sample = posterior_mean
 
                 priority_scores = torch.sigmoid(raw_priority_sample)
 
+                
                 # --- Routing ---
                 edge_logits = edge_output[:, :, :, :2]
                 score_matrix = edge_logits[:, :, :, 1]  # [B, N, N]
@@ -924,11 +955,20 @@ class LightweightIndustrialDiffusion(nn.Module):
 
                 e = torch.nn.functional.one_hot(new_e_indices, num_classes=self.edge_num_classes).float()
 
-            relevant_priorities = priority_scores[:, op_indices, :]
-            final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+            raw_relevant = raw_priority_sample[:, op_indices, :]
+            raw_final_priorities = raw_relevant.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+            final_priorities = torch.sigmoid(raw_final_priorities)
+
+            # 更新 current_priorities (用 raw_final_priorities !!!)
             temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
-            temp_prio_matrix[:, op_indices] = final_priorities
+            temp_prio_matrix[:, op_indices] = raw_final_priorities 
             current_priorities = temp_prio_matrix.view(-1)
+            
+            # # relevant_priorities = priority_scores[:, op_indices, :]
+            # final_priorities = relevant_priorities.gather(2, actions.unsqueeze(-1)).squeeze(-1)
+            # temp_prio_matrix = torch.zeros((B, num_nodes_per_graph), device=device)
+            # temp_prio_matrix[:, op_indices] = final_priorities
+            # current_priorities = temp_prio_matrix.view(-1)
             
         if num_samples == 1:
             e = e.squeeze(0)  # [N, N, C]

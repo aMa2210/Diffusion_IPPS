@@ -10,7 +10,7 @@ from Generate_random_problem_instances import generate_random_ipps_problem
 # ================= 配置区域 =================
 
 # 输出目录 (你的训练脚本读取这个目录)
-OUTPUT_DIR = Path("Problem_TestSet_GA")
+OUTPUT_DIR = Path("Problem_TestSet_GA_large")
 
 # 总共想生成多少个训练样本？
 # 建议至少几百个，RL通常需要大量数据
@@ -21,13 +21,13 @@ TOTAL_SAMPLES = 1000
 # 格式: (工件数量范围, 机器数量范围, 权重占比)
 PROBLEM_CONFIGS = [
     # [Small]  工件 5-10, 机器 3-5 (占比 20%) -> 适合初期快速学习逻辑
-    {"job_range": (5, 10), "mach_range": (3, 5), "weight": 0.2},
+    {"job_range": (50, 70), "mach_range": (5,8), "weight": 0.2},
 
     # [Medium] 工件 10-30, 机器 5-10 (占比 50%) -> 主力训练数据
-    {"job_range": (10, 20), "mach_range": (5, 8), "weight": 0.5},
+    {"job_range": (70, 100), "mach_range": (5, 10), "weight": 0.5},
 
     # [Large]  工件 30-50, 机器 10-15 (占比 30%) -> 提升泛化能力
-    {"job_range": (20, 30), "mach_range": (8, 10), "weight": 0.3},
+    {"job_range": (100, 120), "mach_range": (10, 12), "weight": 0.3},
 ]
 
 # 工序参数 (可以根据实际工厂情况微调)
